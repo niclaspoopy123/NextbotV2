@@ -1,0 +1,2164 @@
+local Players = game:GetService("Players")
+local PathfindingService = game:GetService("PathfindingService")
+local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
+local Workspace = game:GetService("Workspace")
+
+-- [[ GENIUS NEXTBOT V25.0 - OVERHEAD KILL VOLUME + TRUE LANDING PREDICTION (NO TELEPORT / NO GLITCH / FAIR JUMP) ]]
+
+local CONFIG = {
+    -- Visuals
+    IMAGE_ID = "rbxassetid://73737627", 
+    AUDIO_CHASE_ID = "rbxassetid://1848090833", 
+    AUDIO_JUMPSCARE_ID = "rbxassetid://9060084190",
+    
+    -- Mechanics
+    KILL_DIST = 5, 
+    SPAWN_DIST = 45,
+    CONSTANT_SPEED = 60, 
+    JUMP_HEIGHT = 7.2, -- EXACTLY a default player's jump. No super jump. No boosts.
+    
+    -- [[ OVERHEAD KILL VOLUME - the head is a 7x10 wall spanning root+0..+10.
+    --      The kill volume now matches that geometry: land on it / pass over
+    --      it within reach = death. This is THE "goes under me" fix. ]]
+    KILL_FLAT_DIST = 4.5,   -- horizontal reach (head half-width 3.5 + player body)
+    KILL_HEAD_SPAN = 10.5,  -- vertical top of the kill volume (head top + margin)
+    KILL_BELOW_SPAN = -6,   -- vertical bottom (player slightly below root)
+    
+    -- [[ AIRBORNE DETECTION - state can lag; velocity cannot ]]
+    AIR_VY_FALL = -7,       -- falling faster than this = airborne, state or not
+    AIR_VY_RISE = 15,       -- launched upward faster than this = airborne
+    
+    -- [[ AIRBORNE LANDING PREDICTION ]]
+    AIR_MAX_T = 1.5,
+    AIR_NOW_T = 0.15,
+    AIR_GUARD_LEAD = 0.12,
+    AIR_GUARD_LEAD_MIN = 1,
+    AIR_GUARD_LEAD_MAX = 4,
+    GUARD_HOLD_RADIUS = 2.5, -- parked on the landing zone: stop, don't oscillate
+    
+    -- [[ MEET-THEM JUMP - flat-proximity based (vertical gap no longer blocks it) ]]
+    MEET_JUMP_Y_DIFF = 2,
+    MEET_JUMP_FLAT = 7,
+    MEET_JUMP_DESCENT = -6,
+    MEET_JUMP_APEX_VY = 6,   -- player hanging near apex over us
+    MEET_JUMP_APEX_Y = 9.5,
+    
+    -- [[ BALLISTIC JUMP ENGINE ]]
+    JUMP_MIN_SPEED = 6,
+    JUMP_COOLDOWN = 0.45,
+    JUMP_APEX_CLEAR = 5.0,
+    JUMP_RANGE_FACTOR = 0.9,
+    JUMP_MAX_LANDING_DROP = 10,
+    
+    -- Anti-Juke Prediction Engine
+    MAX_LEAD_TIME = 0.55,
+    CLOSE_LOCK_DIST = 12,
+    CLOSE_LOCK_STRENGTH = 0.9,
+    JUKE_RECOVERY_TIME = 0.35,
+    JUKE_DETECT_DOT = 0.55,
+    WALL_READ_DIST = 25,
+    CORNER_TRAP_MAX_DIST = 150,
+    CORNER_BOUNCE2_READ = true,
+    
+    -- Turn Assist
+    TURN_BRAKE_MIN_SPEED = 18,
+    TURN_BRAKE_DOT = 0.3,
+    TURN_BRAKE_STRENGTH = 0.25,
+    TURN_BRAKE_COOLDOWN = 0.2,
+    
+    -- Pathfinding (Roblox fallback)
+    PATH_REFRESH_CLOSE = 0.05,
+    PATH_REFRESH_FAR = 0.10,
+    AIM_DRIFT_REPATH = 4,
+    WAYPOINT_SPACING = 1,
+    PARTIAL_STUCK_RATIO = 0.45,
+    
+    -- Racing-Line (Roblox fallback paths only)
+    STRING_PULL_BUDGET = 9,
+    PULL_Y_TOLERANCE = 10,
+    WAYPOINT_PASS_DOT = 0.35,
+    WAYPOINT_PASS_MIN = 5,
+    WAYPOINT_PASS_MAX = 14,
+    
+    -- LOS Corridor
+    LOS_CORRIDOR_HALF = 2.5,
+    
+    -- Wall-Slide Steering
+    STEER_PROBE_DIST = 12,
+    STEER_MIN_AIM_DIST = 8,
+    STEER_SLIDE_OFFSET = 8,
+    STEER_WALL_GAP = 2.5,
+    
+    -- Early Jump (Roblox fallback)
+    EARLY_JUMP_LEAD = 0.10,
+    EARLY_JUMP_BASE = 2,
+    
+    -- [[ ROLLING NAV GRID ]]
+    NAV_RES = 3,
+    NAV_HALF = 40,
+    NAV_MAX_RAYS_PER_FRAME = 1000,
+    NAV_WARMUP_RAY_MULT = 2.5,
+    NAV_SHIFT_AT = 3,
+    NAV_FORCE_REBUILD_AGE = 12,
+    NAV_VERIFY_PER_FRAME = 18,
+    NAV_ACTIVE_DRAIN_RAYS = 200,
+    NAV_EDGE_MARGIN = 6,
+    NAV_STEP_UP_WALK = 3,
+    NAV_STEP_UP_JUMP = 7.2,
+    NAV_MAX_DROP = 10,
+    NAV_JUMP_COST = 1.25,
+    NAV_DROP_COST = 1.2,
+    NAV_MIN_COST = 0.66,
+    
+    -- [[ FLOW FIELD ENGINE ]]
+    NAV_FIELD_MIN_INTERVAL = 0.12,
+    NAV_FIELD_MAX_EXPANSIONS = 4500,
+    NAV_FIELD_AGE = 0.6,
+    
+    -- [[ TEMPORAL HEAT MAP ]]
+    NAV_HEAT_BUMP_STUCK = 1.2,
+    NAV_HEAT_BUMP_PARTIAL = 0.6,
+    NAV_HEAT_BUMP_BLOCK = 0.8,
+    NAV_HEAT_MAX = 4,
+    NAV_HEAT_DECAY = 0.55,
+    
+    -- [[ POCKET AMBUSH ]]
+    POCKET_INTERVAL = 0.4,
+    POCKET_DEPTH = 8,
+    POCKET_CAP = 260,
+    POCKET_MAX_EXITS = 3,
+    POCKET_RACE_MARGIN = 4,
+    AMBUSH_PUSH_AFTER = 3.0,
+    AMBUSH_PUSH_COOLDOWN = 2.5,
+    
+    -- Unstuck Mechanics (PHYSICS ONLY - all launches stay BELOW normal jump height)
+    UNSTUCK_VELOCITY_UP = 25,
+    UNSTUCK_VELOCITY_FORWARD = 15,
+    UNSTUCK_BURST_THRESHOLD = 6,
+    UNSTUCK_HEAVY_UP = 45,      -- peaks ~5.2 studs (a normal jump is 7.2)
+    UNSTUCK_HEAVY_FORWARD = 30,
+    UNSTUCK_HEAVY_SIDE = 25,
+    ESCAPE_SCAN_DIST = 12,
+    
+    -- World Analysis
+    SPEED_BOOST_MATS = { [Enum.Material.Neon] = 1.5, [Enum.Material.Ice] = 1.3 },
+    SPEED_SLOW_MATS = { [Enum.Material.Sand] = 0.7, [Enum.Material.Grass] = 0.9 },
+    
+    -- Adaptive Difficulty
+    DIFFICULTY_SCALE_KILLS = 0.02,
+    DIFFICULTY_MAX_MULTIPLIER = 1.5,
+    CHASE_ACCEL_CLOSE = 1.15,
+    
+    -- Audio
+    CHASE_VOLUME_MIN = 0.2,
+    CHASE_VOLUME_MAX = 1.0,
+    CHASE_AUDIO_RANGE = 100,
+    
+    -- Debug
+    SHOW_WAYPOINTS = false, 
+    WAYPOINT_COLOR = BrickColor.new("Lime green")
+}
+
+local RAY_PARAMS = RaycastParams.new()
+RAY_PARAMS.FilterType = Enum.RaycastFilterType.Exclude
+RAY_PARAMS.IgnoreWater = false 
+
+local SCORE = 0 
+local IS_FROZEN = false 
+local IS_SPECTATING = false 
+
+-- ========================================================================
+-- [[ UNJUKEABLE PREDICTION ENGINE ]]
+-- ========================================================================
+
+local JukeState = {
+    lastVel = Vector3.zero,
+    reversalUntil = 0,
+    jukeCount = 0,
+    jukeDecayTimer = 0,
+    leadScale = 1,
+    errEMA = 3,
+    avgSpeed = 16,
+    predLog = {},
+}
+
+-- Shared airborne state (written by the prediction engine, read by steering)
+local AirState = { active = false, tLand = 0, landing = Vector3.zero }
+
+local function resetJukeMemory()
+    JukeState.reversalUntil = 0
+    JukeState.jukeCount = 0
+    JukeState.leadScale = 1
+    JukeState.errEMA = 3
+    JukeState.predLog = {}
+    JukeState.lastVel = Vector3.zero
+    AirState.active = false
+    AirState.tLand = 0
+end
+
+local function updateJukeDetection(vel, now, dt)
+    local speed = vel.Magnitude
+    local prev = JukeState.lastVel
+    if speed > 6 and prev.Magnitude > 6 then
+        local dot = vel.Unit:Dot(prev.Unit)
+        if dot < CONFIG.JUKE_DETECT_DOT then
+            JukeState.reversalUntil = now + CONFIG.JUKE_RECOVERY_TIME
+            JukeState.jukeCount = math.min(JukeState.jukeCount + 1, 8)
+        end
+    end
+    JukeState.lastVel = vel
+
+    JukeState.jukeDecayTimer += dt
+    if JukeState.jukeDecayTimer >= 1 then
+        JukeState.jukeDecayTimer = 0
+        JukeState.jukeCount = math.max(0, JukeState.jukeCount - 1)
+    end
+end
+
+local function auditPredictions(now, playerPos)
+    local i = 1
+    while i <= #JukeState.predLog do
+        local e = JukeState.predLog[i]
+        if now >= e.due then
+            local err = ((e.pos - playerPos) * Vector3.new(1, 0, 1)).Magnitude
+            JukeState.errEMA = JukeState.errEMA * 0.7 + err * 0.3
+            table.remove(JukeState.predLog, i)
+        else
+            i += 1
+        end
+    end
+
+    local tolerance = math.max(4, JukeState.avgSpeed * 0.18)
+    local targetScale = (JukeState.errEMA > tolerance) and 0.2 or 1
+    JukeState.leadScale += (targetScale - JukeState.leadScale) * 0.08
+    JukeState.leadScale = math.clamp(JukeState.leadScale, 0.15, 1)
+end
+
+local function solveInterceptTime(botFlat, playerFlat, playerVel, botSpeed, maxLead)
+    local D = playerFlat - botFlat
+    local V = playerVel
+    local a = V:Dot(V) - botSpeed * botSpeed
+    local b = 2 * D:Dot(V)
+    local c = D:Dot(D)
+
+    local t = nil
+    if a < -0.001 then
+        local disc = b * b - 4 * a * c
+        local sq = math.sqrt(math.max(disc, 0))
+        local t1 = (-b + sq) / (2 * a)
+        local t2 = (-b - sq) / (2 * a)
+        if t1 > 0 and t2 > 0 then
+            t = math.min(t1, t2)
+        elseif t1 > 0 then
+            t = t1
+        elseif t2 > 0 then
+            t = t2
+        end
+    end
+    if not t or t ~= t then
+        t = math.sqrt(c) / math.max(botSpeed, 1)
+    end
+    return math.clamp(t, 0.05, maxLead)
+end
+
+-- ========================================================================
+-- [[ AIRBORNE ENGINE v2 ]]
+-- Detection: humanoid state OR raw vertical velocity (the server-side state
+-- can lag or lie mid-jump; the velocity never does).
+-- Landing: two-pass ballistic solve. Pass 1 estimates time from the floor
+-- beneath the player. Pass 2 raycasts down AT THE PREDICTED XZ from above,
+-- so landings on different-height ledges across gaps predict correctly.
+-- ========================================================================
+
+local function isAirborne(playerRoot)
+    local hum = playerRoot.Parent and playerRoot.Parent:FindFirstChild("Humanoid")
+    if hum then
+        local state = hum:GetState()
+        if state == Enum.HumanoidStateType.Freefall or state == Enum.HumanoidStateType.Jumping then
+            return true
+        end
+    end
+    local vy = playerRoot.AssemblyLinearVelocity.Y
+    if vy < CONFIG.AIR_VY_FALL or vy > CONFIG.AIR_VY_RISE then
+        return true
+    end
+    return false
+end
+
+local function predictLandingSpot(playerRoot, ignoreList)
+    local pos = playerRoot.Position
+    local vel = playerRoot.AssemblyLinearVelocity
+    local g = workspace.Gravity
+    local vy = vel.Y
+    local flat = vel * Vector3.new(1, 0, 1)
+    
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.FilterDescendantsInstances = ignoreList
+    rp.IgnoreWater = false
+    
+    -- Pass 1: floor estimate under the player
+    local floorY = pos.Y - 7.2
+    local g1 = workspace:Raycast(pos + Vector3.new(0, 1, 0), Vector3.new(0, -80, 0), rp)
+    if g1 then floorY = g1.Position.Y end
+    
+    local dy = math.max(pos.Y - floorY, 0)
+    local disc = vy * vy + 2 * g * dy
+    local t = disc >= 0 and (vy + math.sqrt(disc)) / g or 0
+    
+    -- Pass 2: the floor AT THE PREDICTED LANDING XZ, cast from above so
+    -- higher landing platforms are found. A falling player can't land above
+    -- themselves, so only accept surfaces physically reachable.
+    local lx = pos.X + flat.X * t
+    local lz = pos.Z + flat.Z * t
+    local g2 = workspace:Raycast(Vector3.new(lx, pos.Y + 10, lz), Vector3.new(0, -90, 0), rp)
+    if g2 then
+        local maxY = (vy > 0) and (pos.Y + (vy * vy) / (2 * g)) or (pos.Y - 1)
+        if g2.Position.Y <= maxY then
+            floorY = g2.Position.Y
+        end
+    end
+    
+    -- Re-solve with the refined floor
+    dy = math.max(pos.Y - floorY, 0)
+    disc = vy * vy + 2 * g * dy
+    t = disc >= 0 and (vy + math.sqrt(disc)) / g or 0
+    t = math.clamp(t, 0, CONFIG.AIR_MAX_T)
+    
+    local landing = Vector3.new(pos.X + flat.X * t, floorY + 3, pos.Z + flat.Z * t)
+    return landing, t, flat
+end
+
+local function calculateUnjukeableMove(botRoot, playerRoot, botSpeed, ignoreList, dt)
+    local now = tick()
+    local playerPos = playerRoot.Position
+    local vel = playerRoot.AssemblyLinearVelocity * Vector3.new(1, 0, 1)
+    local speed = vel.Magnitude
+
+    AirState.active = false
+
+    updateJukeDetection(vel, now, dt)
+    auditPredictions(now, playerPos)
+    JukeState.avgSpeed = JukeState.avgSpeed * 0.95 + speed * 0.05
+
+    -- LAYER 0: AIR DROP - the player is airborne -> aim at the TOUCHDOWN point
+    if isAirborne(playerRoot) then
+        local landing, tLand, flat = predictLandingSpot(playerRoot, ignoreList)
+        AirState.active = true
+        AirState.landing = landing
+        AirState.tLand = tLand
+        if tLand < CONFIG.AIR_NOW_T then
+            -- Touching down NOW: be on the landing spot itself (never their
+            -- airborne position - that's the shadow that made it slide under)
+            return landing, "TOUCHDOWN"
+        end
+        local guardLead = math.clamp(flat.Magnitude * CONFIG.AIR_GUARD_LEAD, CONFIG.AIR_GUARD_LEAD_MIN, CONFIG.AIR_GUARD_LEAD_MAX)
+        local flatU = (flat.Magnitude > 1) and flat.Unit or Vector3.zero
+        return landing + flatU * guardLead, "AIR DROP"
+    end
+
+    if speed < 4 then
+        return playerPos, "STATIONARY"
+    end
+
+    if (playerPos.Y - botRoot.Position.Y) > 8 then
+        return nil, "HIGH GROUND"
+    end
+
+    local botFlat = Vector3.new(botRoot.Position.X, 0, botRoot.Position.Z)
+    local playerFlat = Vector3.new(playerPos.X, 0, playerPos.Z)
+    local dist = (playerFlat - botFlat).Magnitude
+
+    local aimPos, tag = nil, "INTERCEPT"
+
+    -- LAYER 1: WALL CUT (+ double bounce)
+    RAY_PARAMS.FilterDescendantsInstances = ignoreList
+    local wallReadDist = math.min(CONFIG.WALL_READ_DIST, speed * 0.9)
+    local forwardRay = workspace:Raycast(playerPos + Vector3.new(0, 1, 0), vel.Unit * wallReadDist, RAY_PARAMS)
+
+    if forwardRay and forwardRay.Instance and dist < CONFIG.CORNER_TRAP_MAX_DIST then
+        local flatNormal = forwardRay.Normal * Vector3.new(1, 0, 1)
+        if flatNormal.Magnitude > 0.2 then
+            flatNormal = flatNormal.Unit
+            local incoming = vel.Unit
+            local reflection = incoming - (2 * incoming:Dot(flatNormal) * flatNormal)
+            aimPos = forwardRay.Position + reflection * (speed * 0.5)
+            tag = "WALL CUT"
+
+            if CONFIG.CORNER_BOUNCE2_READ and reflection.Magnitude > 0.2 then
+                local reflUnit = reflection.Unit
+                local bounce2Len = speed * 0.5 + 4
+                local bounce2Origin = forwardRay.Position + Vector3.new(0, 1, 0) + reflUnit * 0.5
+                local secondRay = workspace:Raycast(bounce2Origin, reflUnit * bounce2Len, RAY_PARAMS)
+                if secondRay and secondRay.Instance then
+                    local n2 = secondRay.Normal * Vector3.new(1, 0, 1)
+                    if n2.Magnitude > 0.2 then
+                        n2 = n2.Unit
+                        local refl2 = reflUnit - (2 * reflUnit:Dot(n2) * n2)
+                        aimPos = secondRay.Position + refl2 * (speed * 0.4)
+                        tag = "DOUBLE CUT"
+                    end
+                end
+            end
+        end
+    end
+
+    -- LAYER 2: PERFECT INTERCEPT
+    if not aimPos then
+        local jukePenalty = math.min(JukeState.jukeCount, 6) * 0.1
+        local maxLead = math.clamp(CONFIG.MAX_LEAD_TIME * JukeState.leadScale * (1 - jukePenalty), 0.08, CONFIG.MAX_LEAD_TIME)
+        local t = solveInterceptTime(botFlat, playerFlat, vel, math.max(botSpeed, 5), maxLead)
+        aimPos = playerPos + vel * t
+        tag = "INTERCEPT"
+
+        table.insert(JukeState.predLog, { pos = aimPos, due = now + math.max(t, 0.15) })
+        if #JukeState.predLog > 8 then table.remove(JukeState.predLog, 1) end
+    end
+
+    -- LAYER 3: ANTI-JUKE
+    if now < JukeState.reversalUntil then
+        aimPos = playerPos
+        tag = "ANTI-JUKE"
+    end
+
+    -- LAYER 4: CLOSE LOCK (skipped while airborne - blending toward an
+    -- airborne position recreates the shadow chase)
+    local closeBlend = math.clamp(1 - (dist - CONFIG.CLOSE_LOCK_DIST) / 18, 0, 1)
+    if closeBlend > 0 then
+        aimPos = aimPos:Lerp(playerPos, closeBlend * CONFIG.CLOSE_LOCK_STRENGTH)
+        if closeBlend > 0.6 then tag = "LOCKED" end
+    end
+
+    return aimPos, tag
+end
+
+-- ========================================================================
+-- [[ BALLISTIC JUMP ENGINE ]]
+-- ========================================================================
+
+local JumpState = { lastJump = 0 }
+
+local function jumpBallistics()
+    local g = workspace.Gravity
+    local vy = math.sqrt(2 * g * CONFIG.JUMP_HEIGHT)
+    return vy, 2 * vy / g
+end
+
+local function evaluateJump(botRoot, flatVel, ignoreList)
+    RAY_PARAMS.FilterDescendantsInstances = ignoreList
+    local speed = flatVel.Magnitude
+    if speed < CONFIG.JUMP_MIN_SPEED then return false, "SLOW" end
+    local dir = flatVel.Unit
+    local botPos = botRoot.Position
+
+    local lookAhead = math.clamp(4 + speed * 0.08, 5, 12)
+    local knee = workspace:Raycast(botPos - Vector3.new(0, 2, 0), dir * lookAhead, RAY_PARAMS)
+    if not knee then return false, "NONE" end
+
+    local apexRay = workspace:Raycast(
+        botPos + Vector3.new(0, CONFIG.JUMP_APEX_CLEAR, 0),
+        dir * (lookAhead + 6), RAY_PARAMS)
+    if apexRay then
+        return false, "TOO_TALL"
+    end
+
+    local _, airtime = jumpBallistics()
+    local range = speed * airtime * CONFIG.JUMP_RANGE_FACTOR
+    local arcRay = workspace:Raycast(
+        botPos + Vector3.new(0, CONFIG.JUMP_HEIGHT - 1, 0),
+        dir * range, RAY_PARAMS)
+    if arcRay then return false, "CEILING" end
+
+    local landX = botPos + dir * range
+    local ground = workspace:Raycast(
+        landX + Vector3.new(0, 4, 0),
+        Vector3.new(0, -(CONFIG.JUMP_MAX_LANDING_DROP + 12), 0), RAY_PARAMS)
+    if not ground then return false, "VOID" end
+    if (botPos.Y - 3) - ground.Position.Y > CONFIG.JUMP_MAX_LANDING_DROP then
+        return false, "DROP"
+    end
+
+    local headClear = workspace:Raycast(
+        ground.Position + Vector3.new(0, 1.5, 0),
+        Vector3.new(0, 5.5, 0), RAY_PARAMS)
+    if headClear then return false, "CEILING" end
+
+    return true, "CLEAR"
+end
+
+local function jumpLinkStillClear(botRoot, jumpPoint, ignoreList)
+    RAY_PARAMS.FilterDescendantsInstances = ignoreList
+    local jumpDir = ((jumpPoint.Position - botRoot.Position) * Vector3.new(1, 0, 1))
+    if jumpDir.Magnitude < 0.5 then return true end
+    local flatDist = jumpDir.Magnitude
+    local apexRay = workspace:Raycast(
+        botRoot.Position + Vector3.new(0, CONFIG.JUMP_APEX_CLEAR, 0),
+        jumpDir.Unit * (flatDist + 6), RAY_PARAMS)
+    return not apexRay
+end
+
+-- ========================================================================
+-- [[ ROLLING SELF-HEALING NAV GRID + FLOW FIELD ]]
+-- ========================================================================
+
+local Nav = {
+    RES = CONFIG.NAV_RES,
+    HALF = CONFIG.NAV_HALF,
+    MAX_RAYS = CONFIG.NAV_MAX_RAYS_PER_FRAME,
+    EDGE_MARGIN = CONFIG.NAV_EDGE_MARGIN,
+    STEP_UP_WALK = CONFIG.NAV_STEP_UP_WALK,
+    STEP_UP_JUMP = CONFIG.NAV_STEP_UP_JUMP,
+    MAX_DROP = CONFIG.NAV_MAX_DROP,
+    JUMP_COST = CONFIG.NAV_JUMP_COST,
+    DROP_COST = CONFIG.NAV_DROP_COST,
+    MIN_COST = CONFIG.NAV_MIN_COST,
+    SHIFT_AT = CONFIG.NAV_SHIFT_AT,
+    FORCE_AGE = CONFIG.NAV_FORCE_REBUILD_AGE,
+    
+    active = nil,
+    pending = nil,
+    verifyCursor = 1,
+    firstBuildDone = false,
+}
+
+local NAV_DIRS = {
+    {1, 0, 1}, {-1, 0, 1}, {0, 1, 1}, {0, -1, 1},
+    {1, 1, math.sqrt(2)}, {1, -1, math.sqrt(2)}, {-1, 1, math.sqrt(2)}, {-1, -1, math.sqrt(2)},
+}
+
+local function navCellFromWorld(x, z)
+    return math.floor(x / Nav.RES + 0.5), math.floor(z / Nav.RES + 0.5)
+end
+
+local function navIdx(grid, cx, cz)
+    local ix = cx - grid.cx0
+    local iz = cz - grid.cz0
+    if ix < 0 or iz < 0 or ix >= grid.W or iz >= grid.W then return nil end
+    return iz * grid.W + ix + 1
+end
+
+local function navGridContains(grid, cx, cz, margin)
+    local ix = cx - grid.cx0
+    local iz = cz - grid.cz0
+    local m = margin or 0
+    return ix >= m and iz >= m and ix < grid.W - m and iz < grid.W - m
+end
+
+local function navCostFromMaterial(mat)
+    if mat == Enum.Material.Water then return 5 end
+    local b = CONFIG.SPEED_BOOST_MATS[mat]
+    if b then return math.clamp(1 / b, Nav.MIN_COST, 0.95) end
+    local s = CONFIG.SPEED_SLOW_MATS[mat]
+    if s then return math.clamp(1 / s, 1.05, 8) end
+    return 1
+end
+
+local function bumpHeat(grid, cx, cz, amount)
+    if not grid then return end
+    local W = grid.W
+    if not grid.heat or #grid.heat ~= W * W then
+        local h = table.create(W * W, 0)
+        if grid.heat then
+            for i = 1, math.min(#grid.heat, W * W) do h[i] = grid.heat[i] end
+        end
+        grid.heat = h
+    end
+    local offs = {{0,0},{1,0},{-1,0},{0,1},{0,-1}}
+    for _, o in ipairs(offs) do
+        local idx = navIdx(grid, cx + o[1], cz + o[2])
+        if idx then
+            grid.heat[idx] = math.min(CONFIG.NAV_HEAT_MAX, grid.heat[idx] + amount)
+        end
+    end
+    grid.fieldDirty = true
+end
+
+local function navKillCell(grid, cx, cz, idx)
+    local n = grid.W * grid.W
+    grid.walk[idx] = false
+    if not grid.visited or #grid.visited ~= n then
+        local v = table.create(n, false)
+        if grid.visited then
+            for i = 1, math.min(#grid.visited, n) do v[i] = grid.visited[i] end
+        else
+            for i = 1, n do v[i] = grid.walk[i] end
+        end
+        grid.visited = v
+    end
+    grid.visited[idx] = false
+    if not grid.queue then
+        grid.queue = {}
+        grid.head = 0
+    end
+    bumpHeat(grid, cx, cz, CONFIG.NAV_HEAT_BUMP_BLOCK)
+    for d = 1, 8 do
+        local nx, nz = cx + NAV_DIRS[d][1], cz + NAV_DIRS[d][2]
+        local ni = navIdx(grid, nx, nz)
+        if ni and grid.walk[ni] then
+            table.insert(grid.queue, {nx, nz, grid.height[ni]})
+            break
+        end
+    end
+end
+
+local function navShiftGrid(old, dcx, dcz, botPos, targetPos)
+    local W = old.W
+    local g = {
+        cx0 = old.cx0 + dcx, cz0 = old.cz0 + dcz, W = W,
+        walk = table.create(W * W, false),
+        height = table.create(W * W, 0),
+        cost = table.create(W * W, 1),
+        visited = table.create(W * W, false),
+        heat = table.create(W * W, 0),
+        queue = {}, head = 0,
+        stamp = tick(),
+        rp = old.rp,
+        fieldDirty = true,
+    }
+
+    local oldHeat = old.heat
+    for iz = 0, W - 1 do
+        local oiz = iz - dcz
+        local validRow = oiz >= 0 and oiz < W
+        local rowBase = iz * W
+        local orowBase = validRow and oiz * W or 0
+        for ix = 0, W - 1 do
+            local oix = ix - dcx
+            if validRow and oix >= 0 and oix < W then
+                local ni = rowBase + ix + 1
+                local oi = orowBase + oix + 1
+                g.walk[ni] = old.walk[oi]
+                g.height[ni] = old.height[oi]
+                g.cost[ni] = old.cost[oi]
+                g.visited[ni] = old.visited[oi]
+                if oldHeat then g.heat[ni] = oldHeat[oi] end
+            end
+        end
+    end
+
+    local seeded = {}
+    local function eachNewStrip(fn)
+        if dcx ~= 0 then
+            local x0 = (dcx > 0) and (W - dcx) or 0
+            local x1 = (dcx > 0) and (W - 1) or (-dcx - 1)
+            for ix = x0, x1 do
+                for iz = 0, W - 1 do fn(ix, iz) end
+            end
+        end
+        if dcz ~= 0 then
+            local z0 = (dcz > 0) and (W - dcz) or 0
+            local z1 = (dcz > 0) and (W - 1) or (-dcz - 1)
+            for iz = z0, z1 do
+                for ix = 0, W - 1 do fn(ix, iz) end
+            end
+        end
+    end
+    eachNewStrip(function(ix, iz)
+        local idx = iz * W + ix + 1
+        if not g.visited[idx] then
+            local cx = g.cx0 + ix
+            local cz = g.cz0 + iz
+            for d = 1, 8 do
+                local nx, nz = cx + NAV_DIRS[d][1], cz + NAV_DIRS[d][2]
+                local nidx = navIdx(g, nx, nz)
+                if nidx and g.walk[nidx] and not seeded[nidx] then
+                    seeded[nidx] = true
+                    table.insert(g.queue, {nx, nz, g.height[nidx]})
+                end
+            end
+        end
+    end)
+
+    local function seedPoint(pos)
+        local cx, cz = navCellFromWorld(pos.X, pos.Z)
+        local idx = navIdx(g, cx, cz)
+        if idx and not g.visited[idx] then
+            g.visited[idx] = true
+            local hit = workspace:Raycast(pos + Vector3.new(0, 2, 0), Vector3.new(0, -8, 0), g.rp)
+            if hit then
+                g.walk[idx] = true
+                g.height[idx] = hit.Position.Y
+                g.cost[idx] = navCostFromMaterial(hit.Material)
+                table.insert(g.queue, {cx, cz, hit.Position.Y})
+            end
+        end
+    end
+    seedPoint(botPos)
+    seedPoint(targetPos)
+
+    return g
+end
+
+local function navExpandCell(g, cx, cz, fromH, rayBudget)
+    local rays = 0
+    for d = 1, 8 do
+        if rays >= rayBudget then break end
+        local ncx, ncz = cx + NAV_DIRS[d][1], cz + NAV_DIRS[d][2]
+        local idx = navIdx(g, ncx, ncz)
+        if idx and not g.visited[idx] then
+            g.visited[idx] = true
+            local wx, wz = ncx * Nav.RES, ncz * Nav.RES
+            
+            rays += 1
+            local ground = workspace:Raycast(Vector3.new(wx, fromH + 1.2, wz), Vector3.new(0, -(Nav.MAX_DROP + 2), 0), g.rp)
+            if ground then
+                local h = ground.Position.Y
+                local dh = h - fromH
+                if dh <= Nav.STEP_UP_JUMP and -dh <= Nav.MAX_DROP then
+                    rays += 1
+                    local ceil = workspace:Raycast(Vector3.new(wx, h + 1.5, wz), Vector3.new(0, 5.5, 0), g.rp)
+                    if not ceil then
+                        g.walk[idx] = true
+                        g.height[idx] = h
+                        g.cost[idx] = navCostFromMaterial(ground.Material)
+                        table.insert(g.queue, {ncx, ncz, h})
+                    end
+                end
+            end
+        end
+    end
+    return rays
+end
+
+local function navMaybeStartBuild(botPos, targetPos, ignoreList)
+    if Nav.pending then return end
+
+    local botCx, botCz = navCellFromWorld(botPos.X, botPos.Z)
+    local tgtCx, tgtCz = navCellFromWorld(targetPos.X, targetPos.Z)
+    local midCx = (botCx + tgtCx) // 2
+    local midCz = (botCz + tgtCz) // 2
+    local span = math.max(
+        math.abs(botCx - midCx), math.abs(botCz - midCz),
+        math.abs(tgtCx - midCx), math.abs(tgtCz - midCz)
+    )
+    if span > Nav.HALF - Nav.EDGE_MARGIN - 1 then return end
+
+    local g = Nav.active
+    if g then
+        local dcx = midCx - (g.cx0 + Nav.HALF)
+        local dcz = midCz - (g.cz0 + Nav.HALF)
+
+        local endpointsInside = navGridContains(g, botCx, botCz, 4) and navGridContains(g, tgtCx, tgtCz, 4)
+        local wantShift = (not endpointsInside) or math.abs(dcx) >= Nav.SHIFT_AT or math.abs(dcz) >= Nav.SHIFT_AT
+        local wantFresh = (tick() - g.stamp) > Nav.FORCE_AGE
+
+        if (wantShift and (dcx ~= 0 or dcz ~= 0)) then
+            if math.abs(dcx) > Nav.HALF // 2 or math.abs(dcz) > Nav.HALF // 2 then
+                wantFresh = true
+            else
+                Nav.pending = navShiftGrid(g, dcx, dcz, botPos, targetPos)
+                return
+            end
+        end
+        if not wantFresh then return end
+    end
+
+    local W = Nav.HALF * 2 + 1
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.FilterDescendantsInstances = ignoreList
+    rp.IgnoreWater = false
+
+    local fresh = {
+        cx0 = midCx - Nav.HALF, cz0 = midCz - Nav.HALF, W = W,
+        walk = table.create(W * W, false),
+        height = table.create(W * W, 0),
+        cost = table.create(W * W, 1),
+        visited = table.create(W * W, false),
+        heat = table.create(W * W, 0),
+        queue = {}, head = 0,
+        stamp = tick(),
+        rp = rp,
+    }
+
+    local function seed(pos)
+        local cx, cz = navCellFromWorld(pos.X, pos.Z)
+        local idx = navIdx(fresh, cx, cz)
+        if idx and not fresh.visited[idx] then
+            fresh.visited[idx] = true
+            local hit = workspace:Raycast(pos + Vector3.new(0, 2, 0), Vector3.new(0, -8, 0), rp)
+            if hit then
+                fresh.walk[idx] = true
+                fresh.height[idx] = hit.Position.Y
+                fresh.cost[idx] = navCostFromMaterial(hit.Material)
+                table.insert(fresh.queue, {cx, cz, hit.Position.Y})
+            end
+        end
+    end
+    seed(botPos)
+    seed(targetPos)
+
+    if #fresh.queue > 0 then
+        Nav.active = nil
+        Nav.pending = fresh
+    end
+end
+
+local function navPumpQueues()
+    local g = Nav.pending
+    if g then
+        local budget = Nav.firstBuildDone and Nav.MAX_RAYS or math.floor(Nav.MAX_RAYS * CONFIG.NAV_WARMUP_RAY_MULT)
+        while g.head < #g.queue and budget > 0 do
+            g.head += 1
+            local node = g.queue[g.head]
+            budget -= navExpandCell(g, node[1], node[2], node[3], budget)
+        end
+        if g.head >= #g.queue then
+            Nav.pending = nil
+            Nav.active = g
+            Nav.firstBuildDone = true
+        end
+    end
+
+    local a = Nav.active
+    if a and a.queue and a.head < #a.queue then
+        local budget = CONFIG.NAV_ACTIVE_DRAIN_RAYS
+        while a.head < #a.queue and budget > 0 do
+            a.head += 1
+            local node = a.queue[a.head]
+            budget -= navExpandCell(a, node[1], node[2], node[3], budget)
+        end
+        if a.head > 1024 then
+            local rem = {}
+            for i = a.head + 1, #a.queue do rem[#rem + 1] = a.queue[i] end
+            a.queue = rem
+            a.head = 0
+        end
+    end
+end
+
+local function navNearestWalkable(grid, cx, cz, radius)
+    for r = 0, radius do
+        for dx = -r, r do
+            for dz = -r, r do
+                if math.max(math.abs(dx), math.abs(dz)) == r then
+                    local idx = navIdx(grid, cx + dx, cz + dz)
+                    if idx and grid.walk[idx] then
+                        return idx
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function navEdgeInfo(grid, cx, cz, d)
+    local idxA = navIdx(grid, cx, cz)
+    if not idxA or not grid.walk[idxA] then return false end
+    local dx = NAV_DIRS[d][1]
+    local dz = NAV_DIRS[d][2]
+    local idxB = navIdx(grid, cx + dx, cz + dz)
+    if not idxB or not grid.walk[idxB] then return false end
+    local dh = grid.height[idxB] - grid.height[idxA]
+    if dh > Nav.STEP_UP_JUMP then return false end
+    if -dh > Nav.MAX_DROP then return false end
+    if d > 4 then
+        local o1 = navIdx(grid, cx + dx, cz)
+        local o2 = navIdx(grid, cx, cz + dz)
+        if not (o1 and grid.walk[o1]) or not (o2 and grid.walk[o2]) then return false end
+    end
+    return true, dh > Nav.STEP_UP_WALK, (-dh > 4), idxB
+end
+
+-- [[ FLOW FIELD: Dijkstra flood FROM THE GOALS outward ]]
+local function navComputeField(grid, seedIdxList, botIdx)
+    local W = grid.W
+    local n = W * W
+    local computeNo = (grid.fieldCompute or 0) + 1
+    grid.fieldCompute = computeNo
+    if not grid.dist or #grid.dist ~= n then
+        grid.dist = table.create(n, 0)
+        grid.distStamp = table.create(n, 0)
+        grid.settledStamp = table.create(n, 0)
+    end
+    if not grid.heat or #grid.heat ~= n then
+        local h = table.create(n, 0)
+        if grid.heat then
+            for i = 1, math.min(#grid.heat, n) do h[i] = grid.heat[i] end
+        end
+        grid.heat = h
+    end
+    local dist, distStamp, settledStamp, heat = grid.dist, grid.distStamp, grid.settledStamp, grid.heat
+    local cost = grid.cost
+
+    local hd, hi = {}, {}
+    local hcount = 0
+    local function push(d, idx)
+        hcount += 1
+        local i = hcount
+        hd[i] = d; hi[i] = idx
+        while i > 1 do
+            local p = i // 2
+            if hd[p] <= hd[i] then break end
+            hd[p], hd[i] = hd[i], hd[p]
+            hi[p], hi[i] = hi[i], hi[p]
+            i = p
+        end
+    end
+    local function pop()
+        local topIdx = hi[1]
+        local lastD = hd[hcount]
+        local lastI = hi[hcount]
+        hd[hcount] = nil; hi[hcount] = nil
+        hcount -= 1
+        if hcount > 0 then
+            hd[1] = lastD; hi[1] = lastI
+            local i = 1
+            while true do
+                local l = i * 2
+                local r = l + 1
+                local m = i
+                if l <= hcount and hd[l] < hd[m] then m = l end
+                if r <= hcount and hd[r] < hd[m] then m = r end
+                if m == i then break end
+                hd[i], hd[m] = hd[m], hd[i]
+                hi[i], hi[m] = hi[m], hi[i]
+                i = m
+            end
+        end
+        return topIdx
+    end
+
+    for _, sIdx in ipairs(seedIdxList) do
+        dist[sIdx] = 0
+        distStamp[sIdx] = computeNo
+        push(0, sIdx)
+    end
+
+    local settled = 0
+    local botSettled = false
+    local afterBot = 0
+    while hcount > 0 and settled < CONFIG.NAV_FIELD_MAX_EXPANSIONS do
+        local idx = pop()
+        if settledStamp[idx] ~= computeNo then
+            settledStamp[idx] = computeNo
+            settled += 1
+            if idx == botIdx then botSettled = true end
+            if botSettled then
+                afterBot += 1
+                if afterBot >= 12 then break end
+            end
+
+            local ix = (idx - 1) % W
+            local iz = (idx - 1) // W
+            local cx = grid.cx0 + ix
+            local cz = grid.cz0 + iz
+            local gA = dist[idx]
+            for d = 1, 8 do
+                local ok, jumpE, dropE, idxB = navEdgeInfo(grid, cx, cz, d)
+                if ok then
+                    local step = Nav.RES * NAV_DIRS[d][3] * cost[idxB] * (1 + heat[idxB])
+                    if jumpE then
+                        step *= Nav.JUMP_COST
+                    elseif dropE then
+                        step *= Nav.DROP_COST
+                    end
+                    local t = gA + step
+                    if distStamp[idxB] ~= computeNo or t < dist[idxB] then
+                        dist[idxB] = t
+                        distStamp[idxB] = computeNo
+                        push(t, idxB)
+                    end
+                end
+            end
+        end
+    end
+
+    return botIdx ~= nil and distStamp[botIdx] == computeNo
+end
+
+local function fieldSteer(botRoot, grid)
+    local W = grid.W
+    local computeNo = grid.fieldCompute
+    if not computeNo or not grid.distStamp then return nil end
+    local bcx, bcz = navCellFromWorld(botRoot.Position.X, botRoot.Position.Z)
+    local bIdx = navIdx(grid, bcx, bcz)
+    if not bIdx then return nil end
+
+    if not grid.walk[bIdx] then
+        local nb = navNearestWalkable(grid, bcx, bcz, 2)
+        if not nb then return nil end
+        bIdx = nb
+        bcx = grid.cx0 + ((nb - 1) % W)
+        bcz = grid.cz0 + ((nb - 1) // W)
+    end
+
+    local function dAt(idx)
+        if idx and grid.distStamp[idx] == computeNo then return grid.dist[idx] end
+        return math.huge
+    end
+    local botDist = dAt(bIdx)
+    if botDist == math.huge then return nil end
+    if botDist <= Nav.RES * 1.3 then return "GOAL" end
+
+    local vel = botRoot.AssemblyLinearVelocity * Vector3.new(1, 0, 1)
+    local velU = (vel.Magnitude > 2) and vel.Unit or nil
+
+    local bestIdx, bestVal = nil, math.huge
+    for d = 1, 8 do
+        local ok, _, _, idxB = navEdgeInfo(grid, bcx, bcz, d)
+        if ok then
+            local v = dAt(idxB)
+            if v < math.huge then
+                local score = v
+                if velU then
+                    local dirVec = Vector3.new(NAV_DIRS[d][1], 0, NAV_DIRS[d][2])
+                    score = v - 0.02 * dirVec:Dot(velU)
+                end
+                if score < bestVal then
+                    bestVal = score
+                    bestIdx = idxB
+                end
+            end
+        end
+    end
+    if not bestIdx then return nil end
+
+    local rise = grid.height[bestIdx] - grid.height[bIdx]
+    local wantJump = rise > Nav.STEP_UP_WALK and rise <= Nav.STEP_UP_JUMP
+
+    local nbCx = grid.cx0 + ((bestIdx - 1) % W)
+    local nbCz = grid.cz0 + ((bestIdx - 1) // W)
+    local lookIdx = bestIdx
+    local lookVal = math.huge
+    for d = 1, 8 do
+        local ok, _, _, idxB = navEdgeInfo(grid, nbCx, nbCz, d)
+        if ok then
+            local v = dAt(idxB)
+            if v < lookVal then
+                lookVal = v
+                lookIdx = idxB
+            end
+        end
+    end
+    local lix = grid.cx0 + ((lookIdx - 1) % W)
+    local liz = grid.cz0 + ((lookIdx - 1) // W)
+    local carrot = Vector3.new(lix * Nav.RES, grid.height[lookIdx] + 1.2, liz * Nav.RES)
+    local dirFlat = (carrot - botRoot.Position) * Vector3.new(1, 0, 1)
+    local dir = (dirFlat.Magnitude > 0.1) and dirFlat.Unit or nil
+    return carrot, dir, wantJump
+end
+
+-- [[ POCKET ANALYSIS ]]
+local function navAnalyzePocket(grid, playerPos, botIdx, maxDepth, cap)
+    local W = grid.W
+    local pcx, pcz = navCellFromWorld(playerPos.X, playerPos.Z)
+    local startIdx = navIdx(grid, pcx, pcz)
+    if not startIdx or not grid.walk[startIdx] then
+        startIdx = navNearestWalkable(grid, pcx, pcz, 3)
+        if not startIdx then return nil end
+    end
+    local stamp = (grid.floodStamp or 0) + 1
+    grid.floodStamp = stamp
+    if not grid.floodMark or #grid.floodMark ~= W * W then
+        grid.floodMark = table.create(W * W, 0)
+    end
+    local fm = grid.floodMark
+
+    local queue, qdep = {startIdx}, {0}
+    local head = 0
+    local region = 0
+    local frontier = {}
+    local botInside = (botIdx == startIdx)
+
+    while head < #queue do
+        head += 1
+        local idx = queue[head]
+        if fm[idx] ~= stamp then
+            fm[idx] = stamp
+            region += 1
+            if idx == botIdx then botInside = true end
+            local dep = qdep[head]
+            if dep >= maxDepth or region >= cap then
+                frontier[#frontier + 1] = idx
+            else
+                local cx = grid.cx0 + ((idx - 1) % W)
+                local cz = grid.cz0 + ((idx - 1) // W)
+                for d = 1, 8 do
+                    local ok, _, _, idxB = navEdgeInfo(grid, cx, cz, d)
+                    if ok and fm[idxB] ~= stamp then
+                        queue[#queue + 1] = idxB
+                        qdep[#qdep + 1] = dep + 1
+                    end
+                end
+            end
+        end
+    end
+
+    if botInside then return nil end
+
+    local exits = {}
+    for _, idx in ipairs(frontier) do
+        local cx = grid.cx0 + ((idx - 1) % W)
+        local cz = grid.cz0 + ((idx - 1) // W)
+        local isExit = false
+        for d = 1, 8 do
+            local ok, _, _, idxB = navEdgeInfo(grid, cx, cz, d)
+            if ok and fm[idxB] ~= stamp then
+                isExit = true
+                break
+            end
+        end
+        if isExit then
+            exits[#exits + 1] = {
+                idx = idx,
+                pos = Vector3.new(cx * Nav.RES, grid.height[idx] + 1.2, cz * Nav.RES),
+            }
+        end
+    end
+
+    if #exits == 0 or #exits > CONFIG.POCKET_MAX_EXITS then return nil end
+    return exits
+end
+
+local function navRollingVerify(grid, perFrame, rp)
+    local W = grid.W
+    local n = W * W
+    local killed = false
+    for _ = 1, perFrame do
+        local idx = Nav.verifyCursor
+        Nav.verifyCursor += 1
+        if Nav.verifyCursor > n then Nav.verifyCursor = 1 end
+
+        if grid.walk[idx] then
+            local cx = grid.cx0 + ((idx - 1) % W)
+            local cz = grid.cz0 + ((idx - 1) // W)
+            local h = grid.height[idx]
+            local wx, wz = cx * Nav.RES, cz * Nav.RES
+
+            local down = workspace:Raycast(Vector3.new(wx, h + 1.2, wz), Vector3.new(0, -5.5, 0), rp)
+            local up = workspace:Raycast(Vector3.new(wx, h + 1.5, wz), Vector3.new(0, 5.5, 0), rp)
+            if (not down) or math.abs(down.Position.Y - h) > 2.5 or up then
+                navKillCell(grid, cx, cz, idx)
+                killed = true
+            end
+        end
+    end
+    return killed
+end
+
+local function visualizeFieldDescent(botRoot, grid)
+    local computeNo = grid.fieldCompute
+    if not computeNo or not grid.distStamp then return end
+    local cx, cz = navCellFromWorld(botRoot.Position.X, botRoot.Position.Z)
+    local idx = navIdx(grid, cx, cz)
+    local steps = 0
+    while idx and grid.distStamp[idx] == computeNo and steps < 45 do
+        if steps % 3 == 0 then
+            local ix = (idx - 1) % grid.W
+            local iz = (idx - 1) // grid.W
+            local part = Instance.new("Part")
+            part.Name = "PathVisualV12"
+            part.Shape = Enum.PartType.Ball
+            part.Material = Enum.Material.Neon
+            part.Size = Vector3.new(0.6, 0.6, 0.6)
+            part.Position = Vector3.new((grid.cx0 + ix) * Nav.RES, grid.height[idx] + 1.2, (grid.cz0 + iz) * Nav.RES)
+            part.Anchored = true
+            part.CanCollide = false
+            part.BrickColor = CONFIG.WAYPOINT_COLOR
+            part.Parent = workspace
+            Debris:AddItem(part, 1.5)
+        end
+        local ccx = grid.cx0 + ((idx - 1) % grid.W)
+        local ccz = grid.cz0 + ((idx - 1) // grid.W)
+        local best, bestV = nil, math.huge
+        for d = 1, 8 do
+            local ok, _, _, nb = navEdgeInfo(grid, ccx, ccz, d)
+            if ok and grid.distStamp[nb] == computeNo and grid.dist[nb] < bestV then
+                bestV = grid.dist[nb]
+                best = nb
+            end
+        end
+        if not best or bestV >= grid.dist[idx] then break end
+        idx = best
+        steps += 1
+    end
+end
+
+-- 1. HELPER: RAGDOLL
+local function triggerRagdoll(character)
+    local humanoid = character:FindFirstChild("Humanoid")
+    if not humanoid then return end
+    if humanoid:GetState() == Enum.HumanoidStateType.Physics then return end
+
+    humanoid.BreakJointsOnDeath = false
+    humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+
+    for _, v in pairs(character:GetDescendants()) do
+        if v:IsA("Motor6D") then
+            local a0, a1 = Instance.new("Attachment"), Instance.new("Attachment")
+            a0.CFrame = v.C0; a1.CFrame = v.C1; a0.Parent = v.Part0; a1.Parent = v.Part1
+            local b = Instance.new("BallSocketConstraint"); b.Attachment0 = a0; b.Attachment1 = a1; b.Parent = v.Part0
+            v:Destroy() 
+        elseif v:IsA("BasePart") then
+            v.CanCollide = true 
+        end
+    end
+end
+
+-- 2. GUI BUILDER
+local function createControlGui(player)
+    if player:WaitForChild("PlayerGui"):FindFirstChild("NextbotControlGUI") then
+        local gui = player.PlayerGui.NextbotControlGUI
+        return gui.FreezeButton, gui.SpectateButton
+    end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "NextbotControlGUI"
+    sg.ResetOnSpawn = false 
+    sg.Parent = player:WaitForChild("PlayerGui")
+    
+    local freezeBtn = Instance.new("TextButton")
+    freezeBtn.Name = "FreezeButton"
+    freezeBtn.Size = UDim2.new(0, 200, 0, 50)
+    freezeBtn.Position = UDim2.new(0.5, -100, 0.85, 0)
+    freezeBtn.Text = "FREEZE BOT"
+    freezeBtn.Font = Enum.Font.GothamBold
+    freezeBtn.TextSize = 24
+    freezeBtn.TextColor3 = Color3.new(1,1,1)
+    freezeBtn.BackgroundColor3 = Color3.new(0, 0.4, 0.8)
+    freezeBtn.BorderSizePixel = 2
+    freezeBtn.BorderColor3 = Color3.new(1,1,1)
+    freezeBtn.Parent = sg
+    
+    local c1 = Instance.new("UICorner"); c1.CornerRadius = UDim.new(0, 8); c1.Parent = freezeBtn
+    
+    local spectateBtn = Instance.new("TextButton")
+    spectateBtn.Name = "SpectateButton"
+    spectateBtn.Size = UDim2.new(0, 200, 0, 50)
+    spectateBtn.Position = UDim2.new(0.5, -100, 0.85, -60)
+    spectateBtn.Text = "SPECTATE BOT"
+    spectateBtn.Font = Enum.Font.GothamBold
+    spectateBtn.TextSize = 24
+    spectateBtn.TextColor3 = Color3.new(1,1,1)
+    spectateBtn.BackgroundColor3 = Color3.new(0.5, 0, 0.8)
+    spectateBtn.BorderSizePixel = 2
+    spectateBtn.BorderColor3 = Color3.new(1,1,1)
+    spectateBtn.Parent = sg
+
+    local c2 = Instance.new("UICorner"); c2.CornerRadius = UDim.new(0, 8); c2.Parent = spectateBtn
+    
+    return freezeBtn, spectateBtn
+end
+
+-- 3. RIG BUILDER (player-fair jump)
+local function createNextbot(spawnPos)
+    local model = Instance.new("Model")
+    model.Name = "Nextbot_V25_OverheadKill"
+
+    local root = Instance.new("Part")
+    root.Name = "HumanoidRootPart"
+    root.Size = Vector3.new(2, 2, 1)
+    root.Position = spawnPos
+    root.Transparency = 1; root.CanCollide = false; root.Anchored = false; root.Parent = model
+    
+    local cd = Instance.new("ClickDetector")
+    cd.MaxActivationDistance = 500
+    cd.Parent = root
+
+    local torso = Instance.new("Part")
+    torso.Name = "Torso"; torso.Size = Vector3.new(2, 2, 1); torso.Transparency = 1; torso.CanCollide = false; torso.Parent = model
+
+    -- NOTE: the head spans root+0 .. root+10 (C0 (0,5,0), size 10 tall).
+    -- The kill volume is matched to this real geometry.
+    local head = Instance.new("Part")
+    head.Name = "Head"; head.Size = Vector3.new(7, 10, 1); head.Transparency = 0; head.Material = Enum.Material.Neon; head.Color = Color3.new(0,0,0); head.CanCollide = false; head.Parent = model
+
+    local chaseSound = Instance.new("Sound"); chaseSound.Name = "ChaseMusic"; chaseSound.SoundId = CONFIG.AUDIO_CHASE_ID; chaseSound.Looped = true; chaseSound.Volume = 0.6; chaseSound.RollOffMaxDistance = 200; chaseSound.Parent = root; chaseSound:Play()
+    local screamSound = Instance.new("Sound"); screamSound.Name = "Scream"; screamSound.SoundId = CONFIG.AUDIO_JUMPSCARE_ID; screamSound.Volume = 1; screamSound.Parent = root
+
+    local w1 = Instance.new("Motor6D"); w1.Part0 = root; w1.Part1 = torso; w1.Parent = root
+    local w2 = Instance.new("Motor6D"); w2.Part0 = torso; w2.Part1 = head; w2.C0 = CFrame.new(0, 5, 0); w2.Parent = torso
+
+    local sGui = Instance.new("SurfaceGui"); sGui.Face = Enum.NormalId.Front; sGui.Parent = head
+    local img = Instance.new("ImageLabel"); img.Name = "Face"; img.Size = UDim2.new(1, 0, 1, 0); img.BackgroundTransparency = 1; img.Image = CONFIG.IMAGE_ID; img.Parent = sGui
+    local sGuiBack = sGui:Clone(); sGuiBack.Face = Enum.NormalId.Back; sGuiBack.Parent = head
+
+    local billboard = Instance.new("BillboardGui"); billboard.Size = UDim2.new(0, 200, 0, 50); billboard.StudsOffset = Vector3.new(0, 12, 0); billboard.AlwaysOnTop = true; billboard.Parent = model
+    local label = Instance.new("TextLabel"); label.Name = "StatsLabel"; label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1; label.Text = "KILLS: " .. SCORE; label.TextColor3 = Color3.new(1, 0.2, 0.2); label.TextScaled = true; label.Font = Enum.Font.Code; label.Parent = billboard
+
+    local humanoid = Instance.new("Humanoid"); humanoid.WalkSpeed = CONFIG.CONSTANT_SPEED; humanoid.UseJumpPower = false; humanoid.JumpHeight = CONFIG.JUMP_HEIGHT; humanoid.MaxHealth = 10000; humanoid.HipHeight = 2; humanoid.Parent = model
+
+    humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+    humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+
+    local align = Instance.new("AlignOrientation"); align.Mode = Enum.OrientationAlignmentMode.OneAttachment; align.RigidityEnabled = false; align.Responsiveness = 200; align.Attachment0 = Instance.new("Attachment", root); align.Parent = root
+
+    pcall(function() root:SetNetworkOwner(nil) end)
+    model.Parent = workspace
+    return model, root, humanoid, align, img, head, cd
+end
+
+-- 4. HELPER: VISUALIZATION
+local function visualizeWaypoints(waypoints)
+    if not CONFIG.SHOW_WAYPOINTS then return end
+    for _, c in ipairs(workspace:GetChildren()) do if c.Name == "PathVisualV12" then c:Destroy() end end
+    for i, waypoint in ipairs(waypoints) do
+        if i % 2 == 0 then
+            local part = Instance.new("Part"); part.Name = "PathVisualV12"; part.Shape = Enum.PartType.Ball; part.Material = Enum.Material.Neon; part.Size = Vector3.new(0.6, 0.6, 0.6); part.Position = waypoint.Position; part.Anchored = true; part.CanCollide = false; part.BrickColor = CONFIG.WAYPOINT_COLOR; part.Parent = workspace; Debris:AddItem(part, 1.5)
+        end
+    end
+end
+
+-- 5. ENVIRONMENT LOGIC
+local function hasClearLineOfSight(startPos, endPos, ignoreList)
+    RAY_PARAMS.FilterDescendantsInstances = ignoreList
+    local dir = endPos - startPos
+    local dist = dir.Magnitude
+    if dist > 250 then return false end 
+    
+    if math.abs(startPos.Y - endPos.Y) > 8 then return false end
+
+    if workspace:Raycast(startPos, dir, RAY_PARAMS) then return false end
+    
+    local cframe = CFrame.lookAt(startPos, endPos)
+    local right = cframe.RightVector * CONFIG.LOS_CORRIDOR_HALF 
+    
+    if workspace:Raycast(startPos + right, dir, RAY_PARAMS) then return false end
+    if workspace:Raycast(startPos - right, dir, RAY_PARAMS) then return false end
+
+    return true
+end
+
+local function optimizePath(currentIdx, waypoints, botPos, ignoreList)
+    local n = #waypoints
+    if currentIdx >= n then return n end
+
+    local budget = CONFIG.STRING_PULL_BUDGET
+
+    local function visibleAt(i)
+        if budget <= 0 then return false end
+        local wp = waypoints[i]
+        if not wp then return false end
+        if math.abs(wp.Position.Y - botPos.Y) > CONFIG.PULL_Y_TOLERANCE then return false end
+        budget -= 1
+        return hasClearLineOfSight(botPos, wp.Position, ignoreList)
+    end
+
+    local bestIdx = currentIdx
+    local probe = currentIdx
+    local step = 2
+
+    while probe < n do
+        local nextProbe = math.min(probe + step, n)
+        if visibleAt(nextProbe) then
+            bestIdx = nextProbe
+            probe = nextProbe
+            if nextProbe == n then break end
+            step = step * 2
+        else
+            local lo, hi = probe, nextProbe
+            while hi - lo > 1 and budget > 0 do
+                local mid = math.floor((lo + hi) / 2)
+                if visibleAt(mid) then
+                    lo = mid
+                else
+                    hi = mid
+                end
+            end
+            bestIdx = math.max(bestIdx, lo)
+            break
+        end
+    end
+
+    return math.max(bestIdx, currentIdx)
+end
+
+local function steerAroundObstacle(botPos, aimPos, ignoreList)
+    RAY_PARAMS.FilterDescendantsInstances = ignoreList
+
+    local flatAim = Vector3.new(aimPos.X, botPos.Y, aimPos.Z)
+    local toAim = flatAim - botPos
+    local distToAim = toAim.Magnitude
+    if distToAim < CONFIG.STEER_MIN_AIM_DIST then return aimPos end
+
+    local dir = toAim.Unit
+    local probeDist = math.min(distToAim, CONFIG.STEER_PROBE_DIST)
+    local hit = workspace:Raycast(botPos + Vector3.new(0, 1, 0), dir * probeDist, RAY_PARAMS)
+    if not hit then return aimPos end
+
+    local highRay = workspace:Raycast(botPos + Vector3.new(0, 5, 0), dir * probeDist, RAY_PARAMS)
+    if not highRay then return aimPos end
+
+    local n = hit.Normal * Vector3.new(1, 0, 1)
+    if n.Magnitude < 0.15 then return aimPos end
+    n = n.Unit
+
+    local tangent = dir - dir:Dot(n) * n
+    if tangent.Magnitude < 0.15 then
+        tangent = Vector3.new(-n.Z, 0, n.X)
+    end
+
+    local steer = hit.Position + n * CONFIG.STEER_WALL_GAP + tangent.Unit * CONFIG.STEER_SLIDE_OFFSET
+    return Vector3.new(steer.X, hit.Position.Y, steer.Z)
+end
+
+local function analyseTerrainAndObstacles(botRoot, ignoreList)
+    local rayDown = RaycastParams.new(); rayDown.FilterDescendantsInstances = ignoreList; rayDown.FilterType = Enum.RaycastFilterType.Exclude
+    local floorHit = workspace:Raycast(botRoot.Position, Vector3.new(0, -5, 0), rayDown)
+    
+    local multiplier = 1
+    if floorHit then
+        local mat = floorHit.Material
+        if CONFIG.SPEED_BOOST_MATS[mat] then multiplier = CONFIG.SPEED_BOOST_MATS[mat] end
+        if CONFIG.SPEED_SLOW_MATS[mat] then multiplier = CONFIG.SPEED_SLOW_MATS[mat] end
+    end
+
+    local lookDir = botRoot.CFrame.LookVector * 4.5
+    local wallHit = workspace:Raycast(botRoot.Position, lookDir, rayDown)
+    
+    if wallHit and wallHit.Instance and not wallHit.Instance.Anchored and wallHit.Instance.CanCollide then
+        wallHit.Instance:ApplyImpulse(lookDir * 4000 + Vector3.new(0, 1500, 0))
+    end
+
+    return multiplier
+end
+
+local function snapToGround(pos, ignoreList)
+    local snapRay = RaycastParams.new()
+    snapRay.FilterType = Enum.RaycastFilterType.Exclude
+    snapRay.FilterDescendantsInstances = ignoreList
+    snapRay.IgnoreWater = true
+    local hit = workspace:Raycast(pos + Vector3.new(0, 2, 0), Vector3.new(0, -80, 0), snapRay)
+    if hit then
+        return hit.Position + Vector3.new(0, 3, 0)
+    end
+    return pos
+end
+
+local function buildPathCosts()
+    local costs = { Water = 20, DangerDetector = 99999, Door = 1 }
+    for mat, mult in pairs(CONFIG.SPEED_SLOW_MATS) do
+        costs[mat.Name] = math.clamp(1 / mult, 1.05, 8)
+    end
+    for mat, mult in pairs(CONFIG.SPEED_BOOST_MATS) do
+        costs[mat.Name] = math.clamp(1 / mult, 0.4, 0.95)
+    end
+    return costs
+end
+
+local function findEscapeDirection(botPos, toPlayerFlat, ignoreList)
+    RAY_PARAMS.FilterDescendantsInstances = ignoreList
+    local bestDir = toPlayerFlat
+    local bestScore = -1
+
+    for angle = 0, 315, 45 do
+        local rad = math.rad(angle)
+        local dir = Vector3.new(math.cos(rad), 0, math.sin(rad))
+        local hit = workspace:Raycast(botPos + Vector3.new(0, 1, 0), dir * CONFIG.ESCAPE_SCAN_DIST, RAY_PARAMS)
+        local clearance = hit and (hit.Position - botPos).Magnitude or CONFIG.ESCAPE_SCAN_DIST
+        local score = clearance * (0.55 + 0.45 * math.max(0, dir:Dot(toPlayerFlat)))
+        if score > bestScore then
+            bestScore = score
+            bestDir = dir
+        end
+    end
+
+    return bestDir
+end
+
+-- 6. MAIN AI LOOP
+task.spawn(function()
+    task.wait(1) 
+    
+    local player = Players:GetPlayers()[1] or Players.PlayerAdded:Wait()
+    if not player.Character then player.CharacterAdded:Wait() end
+    local targetRoot = player.Character:WaitForChild("HumanoidRootPart")
+    
+    local startPos = targetRoot.Position + Vector3.new(CONFIG.SPAWN_DIST, 5, 0)
+    local bot, botRoot, botHum, botAlign, botImg, botHead, clickDetector = createNextbot(startPos)
+    print("GENIUS BOT V25.0 ONLINE - OVERHEAD KILL VOLUME + TRUE LANDING PREDICTION")
+
+    local freezeBtn, spectateBtn = createControlGui(player)
+    
+    local function toggleFreeze()
+        IS_FROZEN = not IS_FROZEN
+        if IS_FROZEN then
+            freezeBtn.Text = "UNFREEZE BOT"
+            freezeBtn.BackgroundColor3 = Color3.new(0.8, 0, 0)
+        else
+            freezeBtn.Text = "FREEZE BOT"
+            freezeBtn.BackgroundColor3 = Color3.new(0, 0.4, 0.8)
+        end
+    end
+    
+    local function toggleSpectate()
+        IS_SPECTATING = not IS_SPECTATING
+        local cam = workspace.CurrentCamera
+        if IS_SPECTATING then
+            spectateBtn.Text = "STOP SPECTATING"
+            spectateBtn.BackgroundColor3 = Color3.new(0.8, 0, 0)
+            cam.CameraSubject = botHum
+        else
+            spectateBtn.Text = "SPECTATE BOT"
+            spectateBtn.BackgroundColor3 = Color3.new(0.5, 0, 0.8)
+            if player.Character and player.Character:FindFirstChild("Humanoid") then
+                cam.CameraSubject = player.Character.Humanoid
+            end
+        end
+    end
+
+    freezeBtn.MouseButton1Click:Connect(toggleFreeze)
+    spectateBtn.MouseButton1Click:Connect(toggleSpectate)
+    clickDetector.MouseClick:Connect(function(clickPlayer)
+        if clickPlayer == player then
+            toggleFreeze()
+        end
+    end)
+    
+    player.CharacterAdded:Connect(function(newChar)
+        task.wait(0.5)
+        local newRoot = newChar:WaitForChild("HumanoidRootPart", 5)
+        if newRoot then
+            targetRoot = newRoot
+            resetJukeMemory()
+            JumpState.lastJump = 0
+            Nav.active = nil
+            Nav.pending = nil
+            Nav.firstBuildDone = false
+            Nav.verifyCursor = 1
+        end
+    end)
+    
+    Players.PlayerRemoving:Connect(function(leavingPlayer)
+        if leavingPlayer == player then
+            local newPlayers = Players:GetPlayers()
+            for _, p in ipairs(newPlayers) do
+                if p ~= leavingPlayer and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
+                    player = p
+                    targetRoot = p.Character.HumanoidRootPart
+                    createControlGui(player)
+                    Nav.active = nil
+                    Nav.pending = nil
+                    Nav.firstBuildDone = false
+                    return
+                end
+            end
+        end
+    end)
+
+    -- Roblox fallback state
+    local waypoints = {}
+    local currentPointIndex = 2
+    local lastPathTime = 0
+    local lastTargetPos = targetRoot.Position
+    local lastPathAim = nil
+    local isComputing = false
+    local forceRepath = false
+    local pathSource = nil
+    
+    -- Flow field state
+    local fieldGoalKey, fieldBotKey = nil, nil
+    local fieldLastCompute, fieldBlackoutUntil = 0, 0
+    
+    -- Pocket ambush state
+    local pocketTimer = 0
+    local ambushSuppressUntil = 0
+    local ambush = { target = nil, cellIdx = nil, firstSeen = 0, untilT = 0 }
+    
+    -- Heat decay
+    local heatDecayTimer = 0
+    
+    local lastStuckCheck = tick()
+    local lastStuckPos = botRoot.Position
+    local stuckCount = 0
+    local turnBrakeCooldown = 0
+    
+    local path = PathfindingService:CreatePath({
+        AgentRadius = 2.0, 
+        AgentHeight = 6.0, 
+        AgentCanJump = true,
+        AgentCanClimb = true,
+        WaypointSpacing = CONFIG.WAYPOINT_SPACING, 
+        Costs = buildPathCosts()
+    })
+
+    path.Blocked:Connect(function(blockedWaypointIdx)
+        if pathSource == "roblox" and waypoints and blockedWaypointIdx >= currentPointIndex then 
+            forceRepath = true 
+        end
+    end)
+    
+    local function fieldUsableNow(grid, bcx, bcz)
+        if not grid or not grid.dist or not grid.distStamp or not grid.fieldCompute then return false end
+        local bIdx = navIdx(grid, bcx, bcz)
+        if not bIdx then return false end
+        return grid.distStamp[bIdx] == grid.fieldCompute
+    end
+    
+    local function ensureField(grid, bcx, bcz, aimPos, playerPos, forceNow)
+        if not grid then return false, false end
+        local now = tick()
+        if now < fieldBlackoutUntil then return fieldUsableNow(grid, bcx, bcz), false end
+        local minInt = forceNow and 0.06 or CONFIG.NAV_FIELD_MIN_INTERVAL
+        if grid.dist and (now - fieldLastCompute) < minInt then
+            return fieldUsableNow(grid, bcx, bcz), false
+        end
+
+        local acx, acz = navCellFromWorld(aimPos.X, aimPos.Z)
+        local aimIdx = navIdx(grid, acx, acz)
+        if not aimIdx or not grid.walk[aimIdx] then aimIdx = navNearestWalkable(grid, acx, acz, 3) end
+        local pcx2, pcz2 = navCellFromWorld(playerPos.X, playerPos.Z)
+        local plyIdx = navIdx(grid, pcx2, pcz2)
+        if not plyIdx or not grid.walk[plyIdx] then plyIdx = navNearestWalkable(grid, pcx2, pcz2, 4) end
+
+        local seeds = {}
+        if aimIdx then seeds[#seeds + 1] = aimIdx end
+        if plyIdx and plyIdx ~= aimIdx then seeds[#seeds + 1] = plyIdx end
+        if #seeds == 0 then
+            fieldBlackoutUntil = now + 0.3
+            return false, false
+        end
+
+        local goalKey = table.concat(seeds, ",")
+        local botKey = bcx .. "," .. bcz
+        if not forceNow and grid.dist and not grid.fieldDirty
+            and goalKey == fieldGoalKey and botKey == fieldBotKey
+            and (now - fieldLastCompute) < CONFIG.NAV_FIELD_AGE then
+            return fieldUsableNow(grid, bcx, bcz), false
+        end
+
+        local bIdx = navIdx(grid, bcx, bcz)
+        fieldLastCompute = now
+        fieldGoalKey = goalKey
+        fieldBotKey = botKey
+        grid.fieldDirty = false
+        local ok = navComputeField(grid, seeds, bIdx)
+        if not ok then fieldBlackoutUntil = now + 0.25 end
+        return ok, true
+    end
+    
+    RunService.Heartbeat:Connect(function(dt)
+        local billboard = bot and bot:FindFirstChild("BillboardGui")
+        local statsLabel = billboard and billboard:FindFirstChild("StatsLabel")
+        
+        -- [[ FREEZE LOGIC ]]
+        if IS_FROZEN then
+            if botRoot then
+                botHum:MoveTo(botRoot.Position)
+                botAlign.CFrame = botRoot.CFrame
+            end
+            if statsLabel then 
+                statsLabel.Text = "SYSTEM FROZEN"
+                statsLabel.TextColor3 = Color3.new(0, 1, 1)
+            end
+            return
+        end
+
+        if not player or not player.Parent then
+            local newPlayers = Players:GetPlayers()
+            if #newPlayers > 0 then
+                player = newPlayers[1]
+            else
+                return
+            end
+        end
+        
+        if not player.Character or not player.Character:FindFirstChild("HumanoidRootPart") then
+            return
+        end
+        
+        targetRoot = player.Character.HumanoidRootPart
+        local targetHum = player.Character:FindFirstChild("Humanoid")
+        if not targetHum or targetHum.Health <= 0 then return end
+        if not botRoot or not botRoot.Parent then return end
+        
+        local ignoreList = {bot, player.Character}
+        
+        -- [[ AIRBORNE FLAG - velocity + state, computed once per frame ]]
+        local playerAirborne = isAirborne(targetRoot)
+        
+        -- [[ GEOMETRY: flat distance + vertical offset (used by kill + meet-jump) ]]
+        local killVec = targetRoot.Position - botRoot.Position
+        local flatDistMag = (killVec * Vector3.new(1, 0, 1)).Magnitude
+        local yDiff = killVec.Y
+        local dist = killVec.Magnitude
+        
+        -- [[ NAV GRID ]]
+        navMaybeStartBuild(botRoot.Position, targetRoot.Position, ignoreList)
+        navPumpQueues()
+        
+        local botCx, botCz = navCellFromWorld(botRoot.Position.X, botRoot.Position.Z)
+        local tgtCx, tgtCz = navCellFromWorld(targetRoot.Position.X, targetRoot.Position.Z)
+        local grid = Nav.active
+        local gridUsable = false
+        if grid then
+            gridUsable = navGridContains(grid, botCx, botCz, Nav.EDGE_MARGIN)
+                and navGridContains(grid, tgtCx, tgtCz, Nav.EDGE_MARGIN)
+                and (tick() - grid.stamp) < Nav.FORCE_AGE * 1.5
+
+            RAY_PARAMS.FilterDescendantsInstances = ignoreList
+            if navRollingVerify(grid, CONFIG.NAV_VERIFY_PER_FRAME, RAY_PARAMS) then
+                forceRepath = true
+            end
+
+            heatDecayTimer += dt
+            if heatDecayTimer > 0.5 and grid.heat then
+                heatDecayTimer = 0
+                local h = grid.heat
+                for i = 1, #h do
+                    local v = h[i]
+                    if v > 0.01 then h[i] = v * CONFIG.NAV_HEAT_DECAY else h[i] = 0 end
+                end
+            end
+        end
+        
+        -- [[ SPEED MATH ]]
+        local matMultiplier = analyseTerrainAndObstacles(botRoot, ignoreList)
+        local difficultyMultiplier = math.min(CONFIG.DIFFICULTY_MAX_MULTIPLIER, 1 + (SCORE * CONFIG.DIFFICULTY_SCALE_KILLS))
+        local closeBoost = (dist < 20) and CONFIG.CHASE_ACCEL_CLOSE or 1
+        local botSpeed = CONFIG.CONSTANT_SPEED * matMultiplier * difficultyMultiplier * closeBoost
+        botHum.WalkSpeed = botSpeed
+        
+        -- [[ DISTANCE-BASED AUDIO ]]
+        local chaseSound = botRoot:FindFirstChild("ChaseMusic")
+        if chaseSound then
+            local volumeScale = math.clamp(1 - (dist / CONFIG.CHASE_AUDIO_RANGE), 0, 1)
+            chaseSound.Volume = CONFIG.CHASE_VOLUME_MIN + (CONFIG.CHASE_VOLUME_MAX - CONFIG.CHASE_VOLUME_MIN) * volumeScale
+            chaseSound.PlaybackSpeed = 0.9 + (0.3 * (1 - math.clamp(dist / 50, 0, 1)))
+        end
+        
+        -- ====================================================================
+        -- [[ KILL CHECK - FULL-BODY KILL VOLUME ]]
+        -- Root-to-root under KILL_DIST, OR within the head's actual footprint:
+        -- ~4.5 studs horizontally and anywhere from -6 to +10.5 vertically.
+        -- Landing on the head, passing over it, or brushing it = contact = kill.
+        -- ====================================================================
+        local headSpanKill = flatDistMag < CONFIG.KILL_FLAT_DIST
+            and yDiff > CONFIG.KILL_BELOW_SPAN
+            and yDiff < CONFIG.KILL_HEAD_SPAN
+        if dist < CONFIG.KILL_DIST or headSpanKill then
+            local s = botRoot:FindFirstChild("Scream"); if s then s:Play() end
+            triggerRagdoll(player.Character)
+            targetHum.Health = 0
+            
+            SCORE = SCORE + 1
+            resetJukeMemory()
+            
+            if statsLabel then
+                statsLabel.Text = "KILLS: " .. SCORE
+                statsLabel.TextColor3 = Color3.new(1, 0, 0) 
+                task.delay(0.5, function()
+                    if not IS_FROZEN and statsLabel then statsLabel.TextColor3 = Color3.new(1, 0.2, 0.2) end
+                end)
+            end
+        end
+        
+        -- [[ BALLISTIC JUMP ENGINE ]]
+        local moveVel = botRoot.AssemblyLinearVelocity
+        local flatVel = moveVel * Vector3.new(1,0,1)
+        local jumpReason = nil
+        if flatVel.Magnitude >= CONFIG.JUMP_MIN_SPEED
+            and tick() - JumpState.lastJump > CONFIG.JUMP_COOLDOWN then
+            local jumpOK
+            jumpOK, jumpReason = evaluateJump(botRoot, flatVel, ignoreList)
+            if jumpOK then
+                botHum.Jump = true
+                JumpState.lastJump = tick()
+            end
+        end
+        if jumpReason == "TOO_TALL" and grid then
+            grid.fieldDirty = true
+        end
+
+        -- Anti-ceiling pushdown (only ever REDUCES height)
+        if flatVel.Magnitude > 8 then
+            RAY_PARAMS.FilterDescendantsInstances = ignoreList
+            local headRay = workspace:Raycast(botRoot.Position + Vector3.new(0, 2, 0), flatVel.Unit * 4, RAY_PARAMS)
+            if headRay then
+                local kneeCheck = workspace:Raycast(botRoot.Position - Vector3.new(0, 2, 0), flatVel.Unit * 4, RAY_PARAMS)
+                if not kneeCheck then
+                    botRoot.AssemblyLinearVelocity = botRoot.AssemblyLinearVelocity + Vector3.new(0, -5, 0)
+                end
+            end
+        end
+
+        -- ====================================================================
+        -- [[ MEET-THEM JUMP v2 - FLAT proximity based ]]
+        -- The old 3D-distance gate meant the vertical gap itself disabled the
+        -- counter-jump exactly when it was needed. Now: within 7 studs FLAT and
+        -- they're above us and descending (or hanging near apex) -> jump to meet.
+        -- ====================================================================
+        local targetVy = targetRoot.AssemblyLinearVelocity.Y
+        if yDiff > CONFIG.MEET_JUMP_Y_DIFF and flatDistMag < CONFIG.MEET_JUMP_FLAT then
+            if targetVy < CONFIG.MEET_JUMP_DESCENT
+                or (math.abs(targetVy) < CONFIG.MEET_JUMP_APEX_VY and yDiff < CONFIG.MEET_JUMP_APEX_Y) then
+                botHum.Jump = true
+            end
+        end
+        
+        -- [[ STUCK MONITOR - PURE PHYSICS + heat memory ]]
+        if tick() - lastStuckCheck > 0.2 then
+            local moved = (botRoot.Position - lastStuckPos).Magnitude
+            if moved < 0.8 then
+                stuckCount += 1
+                botHum.Jump = true
+                if grid then bumpHeat(grid, botCx, botCz, CONFIG.NAV_HEAT_BUMP_STUCK) end
+
+                local toPlayer = (targetRoot.Position - botRoot.Position) * Vector3.new(1, 0, 1)
+                if toPlayer.Magnitude > 1 then toPlayer = toPlayer.Unit else toPlayer = botRoot.CFrame.LookVector * Vector3.new(1,0,1) end
+
+                local escapeDir = findEscapeDirection(botRoot.Position, toPlayer, ignoreList)
+                local perp = Vector3.new(-escapeDir.Z, 0, escapeDir.X)
+
+                if stuckCount <= CONFIG.UNSTUCK_BURST_THRESHOLD then
+                    botRoot.AssemblyLinearVelocity = botRoot.AssemblyLinearVelocity
+                        + Vector3.new(0, CONFIG.UNSTUCK_VELOCITY_UP, 0)
+                        + escapeDir * CONFIG.UNSTUCK_VELOCITY_FORWARD
+                else
+                    botRoot.AssemblyLinearVelocity = Vector3.zero
+                    botRoot.AssemblyLinearVelocity = (escapeDir * CONFIG.UNSTUCK_HEAVY_FORWARD)
+                        + (perp * (stuckCount % 2 == 0 and CONFIG.UNSTUCK_HEAVY_SIDE or -CONFIG.UNSTUCK_HEAVY_SIDE))
+                        + Vector3.new(0, CONFIG.UNSTUCK_HEAVY_UP, 0)
+                end
+                forceRepath = true
+            else
+                stuckCount = 0
+                if waypoints then
+                    local expected = math.max(botHum.WalkSpeed * 0.2, 8)
+                    if moved < expected * CONFIG.PARTIAL_STUCK_RATIO then
+                        forceRepath = true
+                        if grid then bumpHeat(grid, botCx, botCz, CONFIG.NAV_HEAT_BUMP_PARTIAL) end
+                    end
+                end
+            end
+            lastStuckPos = botRoot.Position; lastStuckCheck = tick()
+        end
+
+        -- [[ UNJUKEABLE PREDICTION - every frame (LAYER 0 = true landing) ]]
+        local aimPos, moveName = calculateUnjukeableMove(botRoot, targetRoot, botSpeed, ignoreList, dt)
+
+        -- [[ TURN ASSIST - skipped mid-air ]]
+        local now = tick()
+        local botFlatVel = botRoot.AssemblyLinearVelocity * Vector3.new(1, 0, 1)
+        if aimPos and botFlatVel.Magnitude > CONFIG.TURN_BRAKE_MIN_SPEED
+            and now > turnBrakeCooldown
+            and math.abs(botRoot.AssemblyLinearVelocity.Y) < 8 then
+            local desired = (aimPos - botRoot.Position) * Vector3.new(1, 0, 1)
+            if desired.Magnitude > 1 and botFlatVel.Unit:Dot(desired.Unit) < CONFIG.TURN_BRAKE_DOT then
+                turnBrakeCooldown = now + CONFIG.TURN_BRAKE_COOLDOWN
+                local v = botRoot.AssemblyLinearVelocity
+                botRoot.AssemblyLinearVelocity = Vector3.new(botFlatVel.X * CONFIG.TURN_BRAKE_STRENGTH, v.Y, botFlatVel.Z * CONFIG.TURN_BRAKE_STRENGTH)
+            end
+        end
+        
+        -- [[ LOS CHECKS - every frame ]]
+        local canSeeAim = aimPos and hasClearLineOfSight(botRoot.Position, aimPos, ignoreList) or false
+        local canSeePlayer = hasClearLineOfSight(botRoot.Position, targetRoot.Position, ignoreList)
+
+        local faceTarget = targetRoot.Position
+
+        if canSeeAim and aimPos then
+            waypoints = nil
+            pathSource = nil
+            
+            -- ================================================================
+            -- [[ GUARD HOLD: already parked on the landing zone ]]
+            -- Player airborne + we're on their touchdown spot: STOP moving and
+            -- let them land ON us. The head span IS the kill zone, and the
+            -- meet-jump below rises into them if they're still high up.
+            -- ================================================================
+            if playerAirborne and AirState.active and AirState.tLand > 0.08 then
+                local toLanding = (AirState.landing - botRoot.Position) * Vector3.new(1, 0, 1)
+                if toLanding.Magnitude <= CONFIG.GUARD_HOLD_RADIUS then
+                    botHum:MoveTo(botRoot.Position)
+                    faceTarget = targetRoot.Position -- eyes up, watching them fall
+                    if statsLabel and statsLabel.TextColor3 ~= Color3.new(1, 0, 0) then
+                        statsLabel.Text = "KILLS: " .. SCORE .. " [GUARD]"
+                    end
+                else
+                    local movePos = steerAroundObstacle(botRoot.Position, aimPos, ignoreList)
+                    botHum:MoveTo(movePos)
+                    faceTarget = aimPos
+                    if statsLabel and statsLabel.TextColor3 ~= Color3.new(1, 0, 0) then
+                        statsLabel.Text = "KILLS: " .. SCORE .. " [" .. moveName .. "]"
+                    end
+                end
+            else
+                local movePos = steerAroundObstacle(botRoot.Position, aimPos, ignoreList)
+                botHum:MoveTo(movePos)
+                faceTarget = aimPos
+                if statsLabel and statsLabel.TextColor3 ~= Color3.new(1, 0, 0) then
+                    statsLabel.Text = "KILLS: " .. SCORE .. " [" .. moveName .. "]"
+                end
+            end
+        elseif canSeePlayer and not playerAirborne then
+            -- NOTE: locked out while the player is airborne. MoveTo flattens
+            -- their airborne position to the ground - chasing the flattened
+            -- shadow is EXACTLY what made the bot slide under jumpers.
+            waypoints = nil
+            pathSource = nil
+            local movePos = steerAroundObstacle(botRoot.Position, targetRoot.Position, ignoreList)
+            botHum:MoveTo(movePos)
+            faceTarget = targetRoot.Position
+            if statsLabel and statsLabel.TextColor3 ~= Color3.new(1, 0, 0) then
+                statsLabel.Text = "KILLS: " .. SCORE .. " [DIRECT]"
+            end
+        else
+            -- No LOS (or the player is airborne and the landing spot is
+            -- obstructed): navigate to the AIM (the landing point), never the
+            -- airborne shadow.
+            if statsLabel and statsLabel.TextColor3 ~= Color3.new(1, 0, 0) then
+                statsLabel.Text = "KILLS: " .. SCORE .. (pathSource == "nav" and " [NAV]" or "")
+            end
+
+            -- ZERO-IDLE
+            if (isComputing or Nav.pending) and aimPos then
+                botHum:MoveTo(aimPos)
+                faceTarget = aimPos
+            end
+
+            if waypoints and aimPos then
+                local lastWp = waypoints[#waypoints]
+                if lastWp and ((lastWp.Position - aimPos) * Vector3.new(1, 0, 1)).Magnitude > CONFIG.AIM_DRIFT_REPATH then
+                    forceRepath = true
+                end
+            end
+
+            -- [[ POCKET AMBUSH ]]
+            if gridUsable and tick() > ambushSuppressUntil then
+                pocketTimer += dt
+                if pocketTimer >= CONFIG.POCKET_INTERVAL then
+                    pocketTimer = 0
+                    local botIdx = navIdx(grid, botCx, botCz)
+                    local exits = navAnalyzePocket(grid, targetRoot.Position, botIdx, CONFIG.POCKET_DEPTH, CONFIG.POCKET_CAP)
+                    local chosen = nil
+                    if exits then
+                        local bestScore = -math.huge
+                        for _, e in ipairs(exits) do
+                            local pDist = ((e.pos - targetRoot.Position) * Vector3.new(1,0,1)).Magnitude
+                            local bDist = ((e.pos - botRoot.Position) * Vector3.new(1,0,1)).Magnitude
+                            local score = pDist - bDist
+                            if score > bestScore then
+                                bestScore = score
+                                chosen = e
+                            end
+                        end
+                        if #exits > 1 and bestScore < CONFIG.POCKET_RACE_MARGIN then
+                            chosen = nil
+                        end
+                    end
+                    if chosen then
+                        if ambush.cellIdx == chosen.idx then
+                            ambush.untilT = tick() + CONFIG.POCKET_INTERVAL * 2.5
+                        else
+                            ambush.cellIdx = chosen.idx
+                            ambush.target = chosen.pos
+                            ambush.firstSeen = tick()
+                            ambush.untilT = tick() + CONFIG.POCKET_INTERVAL * 2.5
+                        end
+                    else
+                        ambush.target = nil
+                        ambush.cellIdx = nil
+                    end
+                end
+            end
+            
+            local ambushActive = false
+            if ambush.target then
+                if tick() > ambush.untilT then
+                    ambush.target = nil
+                    ambush.cellIdx = nil
+                elseif (tick() - ambush.firstSeen) > CONFIG.AMBUSH_PUSH_AFTER then
+                    ambush.target = nil
+                    ambush.cellIdx = nil
+                    ambushSuppressUntil = tick() + CONFIG.AMBUSH_PUSH_COOLDOWN
+                else
+                    ambushActive = true
+                end
+            end
+            
+            if ambushActive then
+                waypoints = nil
+                pathSource = nil
+                local toExit = (ambush.target - botRoot.Position) * Vector3.new(1, 0, 1)
+                if toExit.Magnitude < 5 then
+                    botHum:MoveTo(botRoot.Position)
+                    faceTarget = targetRoot.Position
+                else
+                    local traveled = false
+                    if gridUsable then
+                        local ok = ensureField(grid, botCx, botCz, ambush.target, ambush.target, forceRepath or grid.fieldDirty)
+                        if ok then
+                            local steer = fieldSteer(botRoot, grid)
+                            if steer == "GOAL" then
+                                botHum:MoveTo(ambush.target)
+                                faceTarget = ambush.target
+                                traveled = true
+                            elseif steer then
+                                botHum:MoveTo(steer)
+                                faceTarget = steer
+                                traveled = true
+                            end
+                        end
+                    end
+                    if not traveled then
+                        botHum:MoveTo(ambush.target)
+                        faceTarget = ambush.target
+                    end
+                end
+                forceRepath = false
+                if statsLabel and statsLabel.TextColor3 ~= Color3.new(1, 0, 0) then
+                    statsLabel.Text = "KILLS: " .. SCORE .. " [AMBUSH]"
+                end
+            else
+                -- [[ FLOW FIELD STEERING ]]
+                local fieldOK = false
+                local fieldFresh = false
+                if gridUsable then
+                    local aimForField = aimPos or targetRoot.Position
+                    fieldOK, fieldFresh = ensureField(grid, botCx, botCz, aimForField, targetRoot.Position, forceRepath or grid.fieldDirty)
+                    if fieldOK then
+                        local steer, dir, wantJump = fieldSteer(botRoot, grid)
+                        if steer == "GOAL" then
+                            waypoints = nil
+                            pathSource = nil
+                            botHum:MoveTo(aimForField)
+                            faceTarget = aimForField
+                        elseif steer then
+                            waypoints = nil
+                            pathSource = nil
+                            botHum:MoveTo(steer)
+                            faceTarget = steer
+                            if wantJump and tick() - JumpState.lastJump > CONFIG.JUMP_COOLDOWN then
+                                local synthVel = (dir or (steer - botRoot.Position) * Vector3.new(1, 0, 1).Unit)
+                                    * math.max(flatVel.Magnitude, 14)
+                                local ok, why = evaluateJump(botRoot, synthVel, ignoreList)
+                                if ok then
+                                    botHum.Jump = true
+                                    JumpState.lastJump = tick()
+                                elseif why == "TOO_TALL" then
+                                    grid.fieldDirty = true
+                                end
+                            end
+                        else
+                            fieldOK = false
+                        end
+                    end
+                    if fieldOK then
+                        forceRepath = false
+                        if fieldFresh and CONFIG.SHOW_WAYPOINTS then
+                            visualizeFieldDescent(botRoot, grid)
+                        end
+                        if statsLabel and statsLabel.TextColor3 ~= Color3.new(1, 0, 0) then
+                            statsLabel.Text = "KILLS: " .. SCORE .. " [FIELD]"
+                        end
+                    end
+                end
+                
+                -- [[ ROBLOX FALLBACK ]]
+                if not fieldOK then
+                    if (isComputing or Nav.pending) and aimPos then
+                        botHum:MoveTo(aimPos)
+                        faceTarget = aimPos
+                    end
+
+                    local targetMoved = (targetRoot.Position - lastTargetPos).Magnitude > 3
+                    local aimMoved = false
+                    if aimPos and lastPathAim then
+                        aimMoved = (aimPos - lastPathAim).Magnitude > CONFIG.AIM_DRIFT_REPATH
+                    end
+
+                    local baseRefresh = dist < 30 and CONFIG.PATH_REFRESH_CLOSE or CONFIG.PATH_REFRESH_FAR
+                    local refreshRate = baseRefresh * (1 - math.min(JukeState.jukeCount, 5) * 0.12)
+                    local pathExpired = (tick() - lastPathTime > refreshRate)
+
+                    if (targetMoved or aimMoved or pathExpired or forceRepath or waypoints == nil) and not isComputing then
+                        isComputing = true; forceRepath = false
+                        lastPathTime = tick(); lastTargetPos = targetRoot.Position
+                        
+                        local pathTarget = aimPos or targetRoot.Position
+                        lastPathAim = pathTarget
+                        
+                        local startBase = botRoot.Position
+                        local aimForPath = pathTarget
+                        local playerRootNow = targetRoot
+                        local computeIgnore = ignoreList
+                        
+                        task.spawn(function()
+                            local startGround = snapToGround(startBase, computeIgnore)
+                            local targetGround = snapToGround(aimForPath, computeIgnore)
+                            local success = pcall(function() path:ComputeAsync(startGround, targetGround) end)
+                            if success and path.Status == Enum.PathStatus.Success then
+                                local newPoints = path:GetWaypoints()
+                                if #newPoints > 0 then
+                                    waypoints = newPoints; currentPointIndex = 2; pathSource = "roblox"
+                                    lastPathAim = newPoints[#newPoints].Position
+                                    visualizeWaypoints(newPoints)
+                                end
+                            elseif success then
+                                local retryGround = snapToGround(playerRootNow.Position, computeIgnore)
+                                local ok2 = pcall(function() path:ComputeAsync(startGround, retryGround) end)
+                                if ok2 and path.Status == Enum.PathStatus.Success then
+                                    local newPoints = path:GetWaypoints()
+                                    if #newPoints > 0 then
+                                        waypoints = newPoints; currentPointIndex = 2; pathSource = "roblox"
+                                        lastPathAim = newPoints[#newPoints].Position
+                                        visualizeWaypoints(newPoints)
+                                    end
+                                else
+                                    botHum:MoveTo(playerRootNow.Position)
+                                end
+                            else
+                                botHum:MoveTo(playerRootNow.Position)
+                            end
+                            isComputing = false
+                        end)
+                    end
+
+                    if waypoints and currentPointIndex <= #waypoints then
+                        currentPointIndex = optimizePath(currentPointIndex, waypoints, botRoot.Position, ignoreList)
+                        local targetPoint = waypoints[currentPointIndex]
+                        if targetPoint then
+                            botHum:MoveTo(targetPoint.Position)
+                            faceTarget = targetPoint.Position
+
+                            local nextPoint = waypoints[currentPointIndex + 1]
+                            local jumpPoint = (targetPoint.Action == Enum.PathWaypointAction.Jump) and targetPoint
+                                or (nextPoint and nextPoint.Action == Enum.PathWaypointAction.Jump and nextPoint) or nil
+                            if jumpPoint then
+                                local flatDist2 = ((jumpPoint.Position - botRoot.Position) * Vector3.new(1, 0, 1)).Magnitude
+                                local earlyDist = CONFIG.EARLY_JUMP_BASE + flatVel.Magnitude * CONFIG.EARLY_JUMP_LEAD
+                                if flatDist2 <= earlyDist then
+                                    if jumpLinkStillClear(botRoot, jumpPoint, ignoreList) then
+                                        botHum.Jump = true
+                                        JumpState.lastJump = tick()
+                                    else
+                                        forceRepath = true
+                                    end
+                                end
+                            end
+                            
+                            local vecToPoint = (targetPoint.Position - botRoot.Position) * Vector3.new(1,0,1)
+                            local currentSpeed = botRoot.AssemblyLinearVelocity.Magnitude
+                            local baseRadius = dist < 25 and 1.2 or 1.8
+                            local arrivalRadius = math.clamp(currentSpeed * 0.06, baseRadius, 5) 
+                            
+                            local arrived = vecToPoint.Magnitude < arrivalRadius and math.abs(targetPoint.Position.Y - botRoot.Position.Y) < 10
+
+                            local passed = false
+                            if not arrived and flatVel.Magnitude > 10 and vecToPoint.Magnitude > 0.1 then
+                                local passRadius = math.clamp(flatVel.Magnitude * 0.22, CONFIG.WAYPOINT_PASS_MIN, CONFIG.WAYPOINT_PASS_MAX)
+                                if vecToPoint.Magnitude < passRadius and vecToPoint.Unit:Dot(flatVel.Unit) < CONFIG.WAYPOINT_PASS_DOT then
+                                    passed = true
+                                end
+                            end
+
+                            if arrived or passed then
+                                currentPointIndex = currentPointIndex + 1
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        -- [[ SMOOTH FACING ]]
+        local faceFlat = (faceTarget - botRoot.Position) * Vector3.new(1, 0, 1)
+        if faceFlat.Magnitude > 0.5 then
+            botAlign.CFrame = CFrame.lookAt(botRoot.Position, Vector3.new(faceTarget.X, botRoot.Position.Y, faceTarget.Z))
+        end
+    end)
+end)
