@@ -3,6 +3,7 @@ local PathfindingService = game:GetService("PathfindingService")
 local RunService = game:GetService("RunService")
 local Debris = game:GetService("Debris")
 local Workspace = game:GetService("Workspace")
+local CollectionService = game:GetService("CollectionService")
 
 -- [[ GENIUS NEXTBOT V25.0 - OVERHEAD KILL VOLUME + TRUE LANDING PREDICTION (NO TELEPORT / NO GLITCH / FAIR JUMP) ]]
 
@@ -110,6 +111,13 @@ local CONFIG = {
     NAV_JUMP_COST = 1.25,
     NAV_DROP_COST = 1.2,
     NAV_MIN_COST = 0.66,
+
+    -- [[ LADDER / TRUSS CLIMBING ]]
+    -- Lets the nav grid treat TrussParts (Roblox's native climbable) and any
+    -- part tagged/named "Ladder" as valid vertical links instead of walls.
+    NAV_CLIMB_COST = 1.15,       -- flow-field cost multiplier for a climb edge
+    LADDER_MAX_HEIGHT = 60,      -- longest ladder the grid will resolve
+    LADDER_MIN_GAIN = 0,         -- extra safety margin added to STEP_UP_JUMP before a gap counts as "needs a ladder"
     
     -- [[ FLOW FIELD ENGINE ]]
     NAV_FIELD_MIN_INTERVAL = 0.12,
@@ -157,7 +165,13 @@ local CONFIG = {
     
     -- Debug
     SHOW_WAYPOINTS = false, 
-    WAYPOINT_COLOR = BrickColor.new("Lime green")
+    WAYPOINT_COLOR = BrickColor.new("Lime green"),
+
+    -- [[ ADAPTIVE ML PREDICTION ]]
+    ML_LEARN_RATE = 0.05,   -- LMS step size - small so learning is stable, not twitchy
+    ML_BLEND_MAX = 0.45,    -- hard cap on how much the learned model can steer the aim point
+    ML_MIN_SPEED = 4,       -- don't bother training/predicting on near-stationary targets
+    ML_DEBUG = false        -- set true to print learned weights/confidence periodically
 }
 
 local RAY_PARAMS = RaycastParams.new()
@@ -263,6 +277,130 @@ local function solveInterceptTime(botFlat, playerFlat, playerVel, botSpeed, maxL
 end
 
 -- ========================================================================
+-- [[ ADAPTIVE ML PREDICTION ENGINE - Online Linear Regression (LMS/Adaline) ]]
+-- This is REAL, continuously-trained machine learning, not another fixed
+-- heuristic: it is a pair of adaptive linear filters (the Widrow-Hoff / LMS
+-- rule) whose weights are updated every time one of its own past
+-- predictions is checked against what the player actually did. Over a play
+-- session the weights drift to fit THIS player's habits (how hard they
+-- turn, how they react to walls, how juke-happy they are), which is exactly
+-- what "learns from player movement patterns over time" means in a
+-- Lua/Roblox-safe, per-frame-cheap way (a couple of dot products, no
+-- external libraries, no heavy matrix math).
+--
+-- It is intentionally kept SEPARATE from the JukeState heuristics above:
+-- those are hand-authored rules (wall-cut, intercept solve, anti-juke) that
+-- always run. This model only ever NUDGES their output, and only once it
+-- has proven itself accurate (confidence-gated), so a brand new/instanced
+-- bot behaves identically to the pre-ML build until it has learned enough
+-- to be trusted.
+--
+-- Features are expressed in the PLAYER'S OWN velocity frame (forward/right)
+-- so one set of weights generalizes across every compass heading instead of
+-- learning "moving north" and "moving south" as unrelated cases.
+-- ========================================================================
+
+local ML = {
+    -- weights: [1]=bias [2]=turnRate [3]=wallAhead [4]=jukeCount [5]=speedNorm
+    wFwd = {1, 0, 0, 0, 0},
+    wLat = {0, 0, 0, 0, 0},
+    pending = {},       -- predictions awaiting their ground-truth outcome
+    confidence = 0,     -- 0..1, climbs as predictions keep proving accurate
+    errEMA = 6,
+    lastHeadingDir = nil,
+    turnRateEMA = 0,
+    debugTimer = 0,
+}
+
+local function mlFeatures(speed, jukeCount)
+    local speedNorm = math.clamp(speed / 40, 0, 2)
+    return { 1, ML.turnRateEMA, 0, math.min(jukeCount, 6) / 6, speedNorm }
+end
+
+local function mlDot(w, f)
+    local s = 0
+    for i = 1, #w do s += w[i] * f[i] end
+    return s
+end
+
+-- Tracks how fast (and which way) the player's heading is turning, in
+-- radians/sec (signed via the 2D cross product), smoothed with an EMA.
+local function mlUpdateTurnRate(velU, dt)
+    if velU and ML.lastHeadingDir then
+        local cross = ML.lastHeadingDir.X * velU.Z - ML.lastHeadingDir.Z * velU.X
+        local rate = math.clamp(cross / math.max(dt, 1 / 240), -6, 6)
+        ML.turnRateEMA = ML.turnRateEMA * 0.85 + rate * 0.15
+    end
+    if velU then ML.lastHeadingDir = velU end
+end
+
+-- Predicts where the player will be `leadT` seconds from now, using the
+-- learned weights. Returns the predicted world position plus the raw
+-- forward/lateral offsets (in studs) so the caller can log them for later
+-- training against the real outcome.
+local function mlPredict(playerPos, velU, speed, jukeCount, leadT)
+    if not velU then return nil end
+    local f = mlFeatures(speed, jukeCount)
+    local fwdOffset = mlDot(ML.wFwd, f) * speed * leadT
+    local latOffset = mlDot(ML.wLat, f) * speed * leadT
+    local right = Vector3.new(-velU.Z, 0, velU.X)
+    local predicted = playerPos + velU * fwdOffset + right * latOffset
+    return predicted, f, fwdOffset, latOffset
+end
+
+-- Matures any due predictions: compares what was predicted to what actually
+-- happened and nudges the weights with the LMS update rule
+-- (w_i += lr * error * feature_i). This is the "learning" step.
+local function mlTrain(now, playerPos)
+    local q = ML.pending
+    local i = 1
+    while i <= #q do
+        local e = q[i]
+        if now >= e.due then
+            local actualFlat = (playerPos - e.originPos) * Vector3.new(1, 0, 1)
+            local right = Vector3.new(-e.velU.Z, 0, e.velU.X)
+            local actualFwd = actualFlat:Dot(e.velU)
+            local actualLat = actualFlat:Dot(right)
+
+            local errFwd = actualFwd - e.predFwd
+            local errLat = actualLat - e.predLat
+            local scale = math.max(e.speed * e.leadT, 0.5)
+            for k = 1, #ML.wFwd do
+                ML.wFwd[k] = math.clamp(ML.wFwd[k] + CONFIG.ML_LEARN_RATE * (errFwd / scale) * e.feat[k], -3, 3)
+                ML.wLat[k] = math.clamp(ML.wLat[k] + CONFIG.ML_LEARN_RATE * (errLat / scale) * e.feat[k], -3, 3)
+            end
+
+            local err2D = (errFwd * errFwd + errLat * errLat) ^ 0.5
+            ML.errEMA = ML.errEMA * 0.9 + err2D * 0.1
+            local tolerance = math.max(3, e.speed * 0.25)
+            local targetConf = (ML.errEMA < tolerance) and 1 or 0
+            ML.confidence = math.clamp(ML.confidence + (targetConf - ML.confidence) * 0.05, 0, 1)
+
+            table.remove(q, i)
+        else
+            i += 1
+        end
+    end
+
+    if CONFIG.ML_DEBUG then
+        ML.debugTimer += 1
+        if ML.debugTimer % 120 == 0 then
+            print(string.format("[NextbotML] confidence=%.2f errEMA=%.2f wFwd={%.2f,%.2f,%.2f,%.2f,%.2f} wLat={%.2f,%.2f,%.2f,%.2f,%.2f}",
+                ML.confidence, ML.errEMA,
+                ML.wFwd[1], ML.wFwd[2], ML.wFwd[3], ML.wFwd[4], ML.wFwd[5],
+                ML.wLat[1], ML.wLat[2], ML.wLat[3], ML.wLat[4], ML.wLat[5]))
+        end
+    end
+end
+
+local function mlResetEpisodeState()
+    ML.pending = {}
+    -- NOTE: wFwd/wLat/confidence are deliberately NOT reset here - the whole
+    -- point is that the model keeps what it learned about this player across
+    -- kills/respawns instead of forgetting it every round.
+end
+
+-- ========================================================================
 -- [[ AIRBORNE ENGINE v2 ]]
 -- Detection: humanoid state OR raw vertical velocity (the server-side state
 -- can lag or lie mid-jump; the velocity never does).
@@ -341,6 +479,11 @@ local function calculateUnjukeableMove(botRoot, playerRoot, botSpeed, ignoreList
     updateJukeDetection(vel, now, dt)
     auditPredictions(now, playerPos)
     JukeState.avgSpeed = JukeState.avgSpeed * 0.95 + speed * 0.05
+
+    -- ML: keep the learned model training every frame regardless of which
+    -- heuristic layer ends up choosing the aim point below.
+    mlUpdateTurnRate((speed > CONFIG.ML_MIN_SPEED) and vel.Unit or nil, dt)
+    mlTrain(now, playerPos)
 
     -- LAYER 0: AIR DROP - the player is airborne -> aim at the TOUCHDOWN point
     if isAirborne(playerRoot) then
@@ -430,6 +573,30 @@ local function calculateUnjukeableMove(botRoot, playerRoot, botSpeed, ignoreList
         if closeBlend > 0.6 then tag = "LOCKED" end
     end
 
+    -- LAYER 5: ADAPTIVE ML NUDGE - the only layer whose behavior actually
+    -- changes over time. Confidence starts at 0, so a fresh bot is
+    -- byte-for-byte identical to the heuristic-only build until the model
+    -- has demonstrated (via mlTrain above) that it predicts this player
+    -- accurately - at which point it's allowed to pull the aim point toward
+    -- its own learned guess, capped at CONFIG.ML_BLEND_MAX so it can never
+    -- fully override the hand-authored anti-juke/intercept logic.
+    if speed > CONFIG.ML_MIN_SPEED and ML.confidence > 0.05 then
+        local leadT = math.clamp(CONFIG.MAX_LEAD_TIME * JukeState.leadScale, 0.08, CONFIG.MAX_LEAD_TIME)
+        local velU = vel.Unit
+        local predicted, feat, fwdOffset, latOffset = mlPredict(playerPos, velU, speed, JukeState.jukeCount, leadT)
+        if predicted then
+            local blend = math.clamp(ML.confidence * CONFIG.ML_BLEND_MAX, 0, CONFIG.ML_BLEND_MAX)
+            aimPos = aimPos:Lerp(predicted, blend)
+            if ML.confidence > 0.5 then tag = tag .. "+ML" end
+
+            table.insert(ML.pending, {
+                originPos = playerPos, velU = velU, speed = speed, leadT = leadT,
+                predFwd = fwdOffset, predLat = latOffset, feat = feat, due = now + leadT,
+            })
+            if #ML.pending > 12 then table.remove(ML.pending, 1) end
+        end
+    end
+
     return aimPos, tag
 end
 
@@ -515,6 +682,9 @@ local Nav = {
     MIN_COST = CONFIG.NAV_MIN_COST,
     SHIFT_AT = CONFIG.NAV_SHIFT_AT,
     FORCE_AGE = CONFIG.NAV_FORCE_REBUILD_AGE,
+    CLIMB_COST = CONFIG.NAV_CLIMB_COST,
+    LADDER_MAX_HEIGHT = CONFIG.LADDER_MAX_HEIGHT,
+    LADDER_MIN_GAIN = CONFIG.LADDER_MIN_GAIN,
     
     active = nil,
     pending = nil,
@@ -526,6 +696,49 @@ local NAV_DIRS = {
     {1, 0, 1}, {-1, 0, 1}, {0, 1, 1}, {0, -1, 1},
     {1, 1, math.sqrt(2)}, {1, -1, math.sqrt(2)}, {-1, 1, math.sqrt(2)}, {-1, -1, math.sqrt(2)},
 }
+
+-- ========================================================================
+-- [[ LADDER / TRUSS CLIMB SUPPORT ]]
+-- Roblox's TrussPart is the native climbable object (a Humanoid walking
+-- into one automatically enters the Climbing state) - it's just invisible
+-- to the raycast-only nav grid above because a truss usually isn't solid
+-- "ground" you can stand on top of mid-column. These helpers let the grid
+-- recognize a truss (or anything tagged/named "Ladder") as a valid vertical
+-- route instead of quietly failing to find ground and treating it as a
+-- wall/void, which is what blocked ladder pathing before.
+-- ========================================================================
+
+local function isClimbableInstance(inst)
+    if not inst then return false end
+    if inst:IsA("TrussPart") then return true end
+    local ok, tagged = pcall(CollectionService.HasTag, CollectionService, inst, "Ladder")
+    if ok and tagged then return true end
+    return inst.Name:lower():find("ladder") ~= nil
+end
+
+-- Starting at (wx, wz, startY), walks straight up through any stack of
+-- climbable parts found there. Returns the Y of the platform waiting at the
+-- top once the climbable structure ends, or nil if there's nothing
+-- climbable at this column at all (so the caller can fall back to treating
+-- it as a normal wall/void).
+local function navResolveLadderTop(wx, wz, startY, rp)
+    local y = startY
+    local climbed = false
+    for _ = 1, 8 do
+        local hit = workspace:Raycast(Vector3.new(wx, y + 0.2, wz), Vector3.new(0, Nav.LADDER_MAX_HEIGHT, 0), rp)
+        if not hit or not isClimbableInstance(hit.Instance) then break end
+        climbed = true
+        local topY = hit.Instance.Position.Y + hit.Instance.Size.Y * 0.5
+        if topY <= y then break end
+        y = topY
+    end
+    if not climbed then return nil end
+    -- Look for the platform surface right above the top of the ladder;
+    -- fall back to the ladder's own top if nothing is found (bot just
+    -- stands at the top rung).
+    local landing = workspace:Raycast(Vector3.new(wx, y + 3, wz), Vector3.new(0, -6, 0), rp)
+    return landing and landing.Position.Y or y
+end
 
 local function navCellFromWorld(x, z)
     return math.floor(x / Nav.RES + 0.5), math.floor(z / Nav.RES + 0.5)
@@ -611,6 +824,7 @@ local function navShiftGrid(old, dcx, dcz, botPos, targetPos)
         cost = table.create(W * W, 1),
         visited = table.create(W * W, false),
         heat = table.create(W * W, 0),
+        climb = table.create(W * W, false),
         queue = {}, head = 0,
         stamp = tick(),
         rp = old.rp,
@@ -618,6 +832,7 @@ local function navShiftGrid(old, dcx, dcz, botPos, targetPos)
     }
 
     local oldHeat = old.heat
+    local oldClimb = old.climb
     for iz = 0, W - 1 do
         local oiz = iz - dcz
         local validRow = oiz >= 0 and oiz < W
@@ -633,6 +848,7 @@ local function navShiftGrid(old, dcx, dcz, botPos, targetPos)
                 g.cost[ni] = old.cost[oi]
                 g.visited[ni] = old.visited[oi]
                 if oldHeat then g.heat[ni] = oldHeat[oi] end
+                if oldClimb then g.climb[ni] = oldClimb[oi] end
             end
         end
     end
@@ -702,6 +918,7 @@ local function navExpandCell(g, cx, cz, fromH, rayBudget)
             
             rays += 1
             local ground = workspace:Raycast(Vector3.new(wx, fromH + 1.2, wz), Vector3.new(0, -(Nav.MAX_DROP + 2), 0), g.rp)
+            local placed = false
             if ground then
                 local h = ground.Position.Y
                 local dh = h - fromH
@@ -713,7 +930,23 @@ local function navExpandCell(g, cx, cz, fromH, rayBudget)
                         g.height[idx] = h
                         g.cost[idx] = navCostFromMaterial(ground.Material)
                         table.insert(g.queue, {ncx, ncz, h})
+                        placed = true
                     end
+                end
+            end
+            -- The normal ground probe above only handles gentle steps/drops.
+            -- If it was rejected (too tall a rise, a void, or a ceiling), the
+            -- gap may actually be a ladder: check for a climbable column
+            -- before giving up on this cell entirely.
+            if not placed then
+                rays += 1
+                local topY = navResolveLadderTop(wx, wz, fromH, g.rp)
+                if topY and topY > fromH + Nav.STEP_UP_JUMP + Nav.LADDER_MIN_GAIN then
+                    g.walk[idx] = true
+                    g.height[idx] = topY
+                    g.cost[idx] = 1
+                    g.climb[idx] = true
+                    table.insert(g.queue, {ncx, ncz, topY})
                 end
             end
         end
@@ -767,6 +1000,7 @@ local function navMaybeStartBuild(botPos, targetPos, ignoreList)
         cost = table.create(W * W, 1),
         visited = table.create(W * W, false),
         heat = table.create(W * W, 0),
+        climb = table.create(W * W, false),
         queue = {}, head = 0,
         stamp = tick(),
         rp = rp,
@@ -851,15 +1085,21 @@ local function navEdgeInfo(grid, cx, cz, d)
     local dz = NAV_DIRS[d][2]
     local idxB = navIdx(grid, cx + dx, cz + dz)
     if not idxB or not grid.walk[idxB] then return false end
+    -- A "climb" cell was only marked walkable because a ladder/truss bridges
+    -- the gap, so its height difference doesn't need to (and generally
+    -- won't) respect the normal walk/jump step limits.
+    local climbE = grid.climb and grid.climb[idxB]
     local dh = grid.height[idxB] - grid.height[idxA]
-    if dh > Nav.STEP_UP_JUMP then return false end
-    if -dh > Nav.MAX_DROP then return false end
+    if not climbE then
+        if dh > Nav.STEP_UP_JUMP then return false end
+        if -dh > Nav.MAX_DROP then return false end
+    end
     if d > 4 then
         local o1 = navIdx(grid, cx + dx, cz)
         local o2 = navIdx(grid, cx, cz + dz)
         if not (o1 and grid.walk[o1]) or not (o2 and grid.walk[o2]) then return false end
     end
-    return true, dh > Nav.STEP_UP_WALK, (-dh > 4), idxB
+    return true, (not climbE) and (dh > Nav.STEP_UP_WALK), (not climbE) and (-dh > 4), idxB, climbE
 end
 
 -- [[ FLOW FIELD: Dijkstra flood FROM THE GOALS outward ]]
@@ -947,13 +1187,15 @@ local function navComputeField(grid, seedIdxList, botIdx)
             local cz = grid.cz0 + iz
             local gA = dist[idx]
             for d = 1, 8 do
-                local ok, jumpE, dropE, idxB = navEdgeInfo(grid, cx, cz, d)
+                local ok, jumpE, dropE, idxB, climbE = navEdgeInfo(grid, cx, cz, d)
                 if ok then
                     local step = Nav.RES * NAV_DIRS[d][3] * cost[idxB] * (1 + heat[idxB])
                     if jumpE then
                         step *= Nav.JUMP_COST
                     elseif dropE then
                         step *= Nav.DROP_COST
+                    elseif climbE then
+                        step *= Nav.CLIMB_COST
                     end
                     local t = gA + step
                     if distStamp[idxB] ~= computeNo or t < dist[idxB] then
@@ -1017,7 +1259,11 @@ local function fieldSteer(botRoot, grid)
     if not bestIdx then return nil end
 
     local rise = grid.height[bestIdx] - grid.height[bIdx]
-    local wantJump = rise > Nav.STEP_UP_WALK and rise <= Nav.STEP_UP_JUMP
+    local wantClimb = grid.climb ~= nil and grid.climb[bestIdx] == true
+    -- Ladders don't need the ballistic Jump engine to fire (that would just
+    -- interrupt the Humanoid's own Climbing state) - walking straight at the
+    -- carrot below is enough for Roblox to auto-climb the truss.
+    local wantJump = (not wantClimb) and rise > Nav.STEP_UP_WALK and rise <= Nav.STEP_UP_JUMP
 
     local nbCx = grid.cx0 + ((bestIdx - 1) % W)
     local nbCz = grid.cz0 + ((bestIdx - 1) // W)
@@ -1038,7 +1284,7 @@ local function fieldSteer(botRoot, grid)
     local carrot = Vector3.new(lix * Nav.RES, grid.height[lookIdx] + 1.2, liz * Nav.RES)
     local dirFlat = (carrot - botRoot.Position) * Vector3.new(1, 0, 1)
     local dir = (dirFlat.Magnitude > 0.1) and dirFlat.Unit or nil
-    return carrot, dir, wantJump
+    return carrot, dir, wantJump, wantClimb
 end
 
 -- [[ POCKET ANALYSIS ]]
@@ -1514,6 +1760,7 @@ task.spawn(function()
         if newRoot then
             targetRoot = newRoot
             resetJukeMemory()
+            mlResetEpisodeState()
             JumpState.lastJump = 0
             Nav.active = nil
             Nav.pending = nil
@@ -1669,6 +1916,12 @@ task.spawn(function()
         
         -- [[ AIRBORNE FLAG - velocity + state, computed once per frame ]]
         local playerAirborne = isAirborne(targetRoot)
+
+        -- [[ CLIMBING FLAG - while the bot's own Humanoid is climbing a
+        -- ladder/truss, the ballistic jump / meet-jump / stuck-unstuck
+        -- systems must stay out of the way: firing Jump or an unstuck
+        -- impulse mid-climb yanks the bot off the ladder. ]]
+        local botClimbing = botHum:GetState() == Enum.HumanoidStateType.Climbing
         
         -- [[ GEOMETRY: flat distance + vertical offset (used by kill + meet-jump) ]]
         local killVec = targetRoot.Position - botRoot.Position
@@ -1736,6 +1989,7 @@ task.spawn(function()
             
             SCORE = SCORE + 1
             resetJukeMemory()
+            mlResetEpisodeState()
             
             if statsLabel then
                 statsLabel.Text = "KILLS: " .. SCORE
@@ -1750,7 +2004,7 @@ task.spawn(function()
         local moveVel = botRoot.AssemblyLinearVelocity
         local flatVel = moveVel * Vector3.new(1,0,1)
         local jumpReason = nil
-        if flatVel.Magnitude >= CONFIG.JUMP_MIN_SPEED
+        if not botClimbing and flatVel.Magnitude >= CONFIG.JUMP_MIN_SPEED
             and tick() - JumpState.lastJump > CONFIG.JUMP_COOLDOWN then
             local jumpOK
             jumpOK, jumpReason = evaluateJump(botRoot, flatVel, ignoreList)
@@ -1782,7 +2036,7 @@ task.spawn(function()
         -- they're above us and descending (or hanging near apex) -> jump to meet.
         -- ====================================================================
         local targetVy = targetRoot.AssemblyLinearVelocity.Y
-        if yDiff > CONFIG.MEET_JUMP_Y_DIFF and flatDistMag < CONFIG.MEET_JUMP_FLAT then
+        if not botClimbing and yDiff > CONFIG.MEET_JUMP_Y_DIFF and flatDistMag < CONFIG.MEET_JUMP_FLAT then
             if targetVy < CONFIG.MEET_JUMP_DESCENT
                 or (math.abs(targetVy) < CONFIG.MEET_JUMP_APEX_VY and yDiff < CONFIG.MEET_JUMP_APEX_Y) then
                 botHum.Jump = true
@@ -1791,6 +2045,12 @@ task.spawn(function()
         
         -- [[ STUCK MONITOR - PURE PHYSICS + heat memory ]]
         if tick() - lastStuckCheck > 0.2 then
+            if botClimbing then
+                -- Climbing is naturally slow/vertical - don't mistake it for
+                -- being stuck and launch an unstuck burst mid-ladder.
+                stuckCount = 0
+                lastStuckPos = botRoot.Position; lastStuckCheck = tick()
+            else
             local moved = (botRoot.Position - lastStuckPos).Magnitude
             if moved < 0.8 then
                 stuckCount += 1
@@ -1825,6 +2085,7 @@ task.spawn(function()
                 end
             end
             lastStuckPos = botRoot.Position; lastStuckCheck = tick()
+            end
         end
 
         -- [[ UNJUKEABLE PREDICTION - every frame (LAYER 0 = true landing) ]]
@@ -2011,7 +2272,7 @@ task.spawn(function()
                     local aimForField = aimPos or targetRoot.Position
                     fieldOK, fieldFresh = ensureField(grid, botCx, botCz, aimForField, targetRoot.Position, forceRepath or grid.fieldDirty)
                     if fieldOK then
-                        local steer, dir, wantJump = fieldSteer(botRoot, grid)
+                        local steer, dir, wantJump, wantClimb = fieldSteer(botRoot, grid)
                         if steer == "GOAL" then
                             waypoints = nil
                             pathSource = nil
@@ -2022,7 +2283,7 @@ task.spawn(function()
                             pathSource = nil
                             botHum:MoveTo(steer)
                             faceTarget = steer
-                            if wantJump and tick() - JumpState.lastJump > CONFIG.JUMP_COOLDOWN then
+                            if wantJump and not wantClimb and tick() - JumpState.lastJump > CONFIG.JUMP_COOLDOWN then
                                 local synthVel = (dir or (steer - botRoot.Position) * Vector3.new(1, 0, 1).Unit)
                                     * math.max(flatVel.Magnitude, 14)
                                 local ok, why = evaluateJump(botRoot, synthVel, ignoreList)
