@@ -711,9 +711,10 @@ local NAV_DIRS = {
 local function isClimbableInstance(inst)
     if not inst then return false end
     if inst:IsA("TrussPart") then return true end
-    local ok, tagged = pcall(CollectionService.HasTag, CollectionService, inst, "Ladder")
-    if ok and tagged then return true end
-    return inst.Name:lower():find("ladder") ~= nil
+    if CollectionService:HasTag(inst, "Ladder") then return true end
+    -- Cheap last resort: only pay for a lowercase/substring check on the
+    -- rare instance that isn't already a recognized TrussPart/tag.
+    return inst.Name:lower():find("ladder", 1, true) ~= nil
 end
 
 -- Starting at (wx, wz, startY), walks straight up through any stack of
@@ -728,7 +729,10 @@ local function navResolveLadderTop(wx, wz, startY, rp)
         local hit = workspace:Raycast(Vector3.new(wx, y + 0.2, wz), Vector3.new(0, Nav.LADDER_MAX_HEIGHT, 0), rp)
         if not hit or not isClimbableInstance(hit.Instance) then break end
         climbed = true
-        local topY = hit.Instance.Position.Y + hit.Instance.Size.Y * 0.5
+        -- Use the part's own CFrame (not raw Position/Size) so a rotated or
+        -- angled truss/ladder still yields the correct WORLD-space top Y.
+        local part = hit.Instance
+        local topY = part.CFrame:PointToWorldSpace(Vector3.new(0, part.Size.Y * 0.5, 0)).Y
         if topY <= y then break end
         y = topY
     end
@@ -2051,40 +2055,40 @@ task.spawn(function()
                 stuckCount = 0
                 lastStuckPos = botRoot.Position; lastStuckCheck = tick()
             else
-            local moved = (botRoot.Position - lastStuckPos).Magnitude
-            if moved < 0.8 then
-                stuckCount += 1
-                botHum.Jump = true
-                if grid then bumpHeat(grid, botCx, botCz, CONFIG.NAV_HEAT_BUMP_STUCK) end
+                local moved = (botRoot.Position - lastStuckPos).Magnitude
+                if moved < 0.8 then
+                    stuckCount += 1
+                    botHum.Jump = true
+                    if grid then bumpHeat(grid, botCx, botCz, CONFIG.NAV_HEAT_BUMP_STUCK) end
 
-                local toPlayer = (targetRoot.Position - botRoot.Position) * Vector3.new(1, 0, 1)
-                if toPlayer.Magnitude > 1 then toPlayer = toPlayer.Unit else toPlayer = botRoot.CFrame.LookVector * Vector3.new(1,0,1) end
+                    local toPlayer = (targetRoot.Position - botRoot.Position) * Vector3.new(1, 0, 1)
+                    if toPlayer.Magnitude > 1 then toPlayer = toPlayer.Unit else toPlayer = botRoot.CFrame.LookVector * Vector3.new(1,0,1) end
 
-                local escapeDir = findEscapeDirection(botRoot.Position, toPlayer, ignoreList)
-                local perp = Vector3.new(-escapeDir.Z, 0, escapeDir.X)
+                    local escapeDir = findEscapeDirection(botRoot.Position, toPlayer, ignoreList)
+                    local perp = Vector3.new(-escapeDir.Z, 0, escapeDir.X)
 
-                if stuckCount <= CONFIG.UNSTUCK_BURST_THRESHOLD then
-                    botRoot.AssemblyLinearVelocity = botRoot.AssemblyLinearVelocity
-                        + Vector3.new(0, CONFIG.UNSTUCK_VELOCITY_UP, 0)
-                        + escapeDir * CONFIG.UNSTUCK_VELOCITY_FORWARD
+                    if stuckCount <= CONFIG.UNSTUCK_BURST_THRESHOLD then
+                        botRoot.AssemblyLinearVelocity = botRoot.AssemblyLinearVelocity
+                            + Vector3.new(0, CONFIG.UNSTUCK_VELOCITY_UP, 0)
+                            + escapeDir * CONFIG.UNSTUCK_VELOCITY_FORWARD
+                    else
+                        botRoot.AssemblyLinearVelocity = Vector3.zero
+                        botRoot.AssemblyLinearVelocity = (escapeDir * CONFIG.UNSTUCK_HEAVY_FORWARD)
+                            + (perp * (stuckCount % 2 == 0 and CONFIG.UNSTUCK_HEAVY_SIDE or -CONFIG.UNSTUCK_HEAVY_SIDE))
+                            + Vector3.new(0, CONFIG.UNSTUCK_HEAVY_UP, 0)
+                    end
+                    forceRepath = true
                 else
-                    botRoot.AssemblyLinearVelocity = Vector3.zero
-                    botRoot.AssemblyLinearVelocity = (escapeDir * CONFIG.UNSTUCK_HEAVY_FORWARD)
-                        + (perp * (stuckCount % 2 == 0 and CONFIG.UNSTUCK_HEAVY_SIDE or -CONFIG.UNSTUCK_HEAVY_SIDE))
-                        + Vector3.new(0, CONFIG.UNSTUCK_HEAVY_UP, 0)
-                end
-                forceRepath = true
-            else
-                stuckCount = 0
-                if waypoints then
-                    local expected = math.max(botHum.WalkSpeed * 0.2, 8)
-                    if moved < expected * CONFIG.PARTIAL_STUCK_RATIO then
-                        forceRepath = true
-                        if grid then bumpHeat(grid, botCx, botCz, CONFIG.NAV_HEAT_BUMP_PARTIAL) end
+                    stuckCount = 0
+                    if waypoints then
+                        local expected = math.max(botHum.WalkSpeed * 0.2, 8)
+                        if moved < expected * CONFIG.PARTIAL_STUCK_RATIO then
+                            forceRepath = true
+                            if grid then bumpHeat(grid, botCx, botCz, CONFIG.NAV_HEAT_BUMP_PARTIAL) end
+                        end
                     end
                 end
-            end
-            lastStuckPos = botRoot.Position; lastStuckCheck = tick()
+                lastStuckPos = botRoot.Position; lastStuckCheck = tick()
             end
         end
 
