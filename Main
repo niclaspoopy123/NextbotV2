@@ -25,6 +25,19 @@ local CONFIG = {
     KILL_FLAT_DIST = 4.5,   -- horizontal reach (head half-width 3.5 + player body)
     KILL_HEAD_SPAN = 10.5,  -- vertical top of the kill volume (head top + margin)
     KILL_BELOW_SPAN = -6,   -- vertical bottom (player slightly below root)
+
+    -- [[ KILL SWEEP - server-authoritative anti-tunneling ]]
+    -- A single point-in-time cylinder test can miss entirely when the bot
+    -- covers a lot of ground in one Heartbeat (high speed, low frame rate,
+    -- lag spike): the player can be "jumped over" between last frame's
+    -- position and this frame's position without ever satisfying the check
+    -- AT either sampled instant. Fix: sweep several samples along the
+    -- segment from the bot's previous root position to its current one and
+    -- test the SAME cylinder against every sample. This keeps the exact
+    -- kill-volume geometry above (fair, bounded, no long-range reach) while
+    -- closing the "goes under/over me" gap.
+    KILL_SWEEP_SAMPLES = 6,     -- points tested along the bot's per-frame movement segment
+    KILL_SWEEP_MAX_DIST = 30,   -- safety cap: never sweep across an implausibly large jump (teleport/respawn)
     
     -- [[ AIRBORNE DETECTION - state can lag; velocity cannot ]]
     AIR_VY_FALL = -7,       -- falling faster than this = airborne, state or not
@@ -37,6 +50,7 @@ local CONFIG = {
     AIR_GUARD_LEAD_MIN = 1,
     AIR_GUARD_LEAD_MAX = 4,
     GUARD_HOLD_RADIUS = 2.5, -- parked on the landing zone: stop, don't oscillate
+    GUARD_HOLD_HYSTERESIS = 1.0, -- once inside the hold radius, must drift this MUCH further out before resuming steering (stops edge flicker)
     
     -- [[ MEET-THEM JUMP - flat-proximity based (vertical gap no longer blocks it) ]]
     MEET_JUMP_Y_DIFF = 2,
@@ -90,6 +104,16 @@ local CONFIG = {
     STEER_MIN_AIM_DIST = 8,
     STEER_SLIDE_OFFSET = 8,
     STEER_WALL_GAP = 2.5,
+    STEER_COMMIT_TIME = 0.2,     -- min time to hold a wall-slide detour target before it's allowed to flip sides
+    STEER_TANGENT_REVERSE_DOT = -0.3, -- committed slide side is kept unless the fresh tangent disagrees more than this (dot product); below it, trust the new reading instead of fighting a real direction reversal
+
+    -- Smooth Facing (kills left-right head shake)
+    FACE_TURN_RATE_DEG = 540,    -- max degrees/sec the bot may rotate to face its target
+    FACE_SNAP_DIST = 0.5,        -- below this flat distance, stop turning entirely (avoids spin noise at point-blank)
+
+    -- Flow-Field Local Target Stability
+    FIELD_TARGET_COMMIT_TIME = 0.18, -- min time to keep steering at the same neighbor cell
+    FIELD_TARGET_SWITCH_MARGIN = 0.35, -- a rival neighbor must beat the committed one by this much (studs of field cost) to steal the choice
     
     -- Early Jump (Roblox fallback)
     EARLY_JUMP_LEAD = 0.10,
@@ -1215,7 +1239,12 @@ local function navComputeField(grid, seedIdxList, botIdx)
     return botIdx ~= nil and distStamp[botIdx] == computeNo
 end
 
-local function fieldSteer(botRoot, grid)
+-- steerState (optional) is a small per-bot table {idx=, untilT=} used purely
+-- for hysteresis: it lets fieldSteer remember which neighbor cell it last
+-- committed to so near-tied candidates don't flip back and forth every
+-- single Heartbeat (the classic cause of flow-field "shake" at corners and
+-- near the goal).
+local function fieldSteer(botRoot, grid, steerState)
     local W = grid.W
     local computeNo = grid.fieldCompute
     if not computeNo or not grid.distStamp then return nil end
@@ -1243,6 +1272,7 @@ local function fieldSteer(botRoot, grid)
     local velU = (vel.Magnitude > 2) and vel.Unit or nil
 
     local bestIdx, bestVal = nil, math.huge
+    local committedIdx, committedVal = nil, math.huge
     for d = 1, 8 do
         local ok, _, _, idxB = navEdgeInfo(grid, bcx, bcz, d)
         if ok then
@@ -1257,10 +1287,35 @@ local function fieldSteer(botRoot, grid)
                     bestVal = score
                     bestIdx = idxB
                 end
+                if steerState and steerState.idx == idxB then
+                    committedIdx = idxB
+                    committedVal = score
+                end
             end
         end
     end
-    if not bestIdx then return nil end
+    if not bestIdx then
+        if steerState then steerState.idx = nil end
+        return nil
+    end
+
+    -- [[ HYSTERESIS ]] Stick with the previously committed neighbor unless a
+    -- rival clearly beats it by FIELD_TARGET_SWITCH_MARGIN, or the minimum
+    -- commit window has expired. Prevents micro-oscillation between two
+    -- near-tied cells (the main source of left-right shake while pursuing).
+    local now = tick()
+    if committedIdx and committedIdx ~= bestIdx then
+        local stillCommitted = steerState and now < (steerState.untilT or 0)
+        local beatByEnough = (committedVal - bestVal) > CONFIG.FIELD_TARGET_SWITCH_MARGIN
+        if stillCommitted and not beatByEnough then
+            bestIdx = committedIdx
+            bestVal = committedVal
+        end
+    end
+    if steerState and steerState.idx ~= bestIdx then
+        steerState.idx = bestIdx
+        steerState.untilT = now + CONFIG.FIELD_TARGET_COMMIT_TIME
+    end
 
     local rise = grid.height[bestIdx] - grid.height[bIdx]
     local wantClimb = grid.climb ~= nil and grid.climb[bestIdx] == true
@@ -1553,6 +1608,45 @@ local function visualizeWaypoints(waypoints)
 end
 
 -- 5. ENVIRONMENT LOGIC
+
+-- [[ OVERHEAD KILL VOLUME TEST ]]
+-- Cylindrical/column test around a candidate bot-root position: same
+-- geometry the comments above describe (flat reach + vertical head span),
+-- factored out so it can be evaluated at more than one sample point per
+-- frame (see the sweep in the Heartbeat kill check below).
+local function pointInKillVolume(samplePos, targetPos)
+    local vec = targetPos - samplePos
+    local flat = (vec * Vector3.new(1, 0, 1)).Magnitude
+    local yDiff = vec.Y
+    if vec.Magnitude < CONFIG.KILL_DIST then return true end
+    return flat < CONFIG.KILL_FLAT_DIST
+        and yDiff > CONFIG.KILL_BELOW_SPAN
+        and yDiff < CONFIG.KILL_HEAD_SPAN
+end
+
+-- Sweeps the kill-volume test across every sample point between the bot's
+-- previous root position and its current one. This is what stops a
+-- fast-moving (or lag-spiking) bot from tunneling straight over a player
+-- without ever satisfying the check at either frame's exact instant - the
+-- classic "goes under/over me" complaint. Bounded by KILL_SWEEP_MAX_DIST so
+-- a teleport/respawn can't be abused into a long-range kill.
+local function sweepKillVolume(prevPos, currPos, targetPos)
+    if pointInKillVolume(currPos, targetPos) then return true end
+
+    local seg = currPos - prevPos
+    local segDist = seg.Magnitude
+    if segDist < 0.05 or segDist > CONFIG.KILL_SWEEP_MAX_DIST then return false end
+
+    local samples = math.max(1, CONFIG.KILL_SWEEP_SAMPLES)
+    for i = 1, samples - 1 do
+        local a = i / samples
+        if pointInKillVolume(prevPos + seg * a, targetPos) then
+            return true
+        end
+    end
+    return false
+end
+
 local function hasClearLineOfSight(startPos, endPos, ignoreList)
     RAY_PARAMS.FilterDescendantsInstances = ignoreList
     local dir = endPos - startPos
@@ -1616,32 +1710,66 @@ local function optimizePath(currentIdx, waypoints, botPos, ignoreList)
     return math.max(bestIdx, currentIdx)
 end
 
-local function steerAroundObstacle(botPos, aimPos, ignoreList)
+local function steerAroundObstacle(botPos, aimPos, ignoreList, steerState)
     RAY_PARAMS.FilterDescendantsInstances = ignoreList
 
     local flatAim = Vector3.new(aimPos.X, botPos.Y, aimPos.Z)
     local toAim = flatAim - botPos
     local distToAim = toAim.Magnitude
-    if distToAim < CONFIG.STEER_MIN_AIM_DIST then return aimPos end
+    if distToAim < CONFIG.STEER_MIN_AIM_DIST then
+        if steerState then steerState.active = false end
+        return aimPos
+    end
 
     local dir = toAim.Unit
     local probeDist = math.min(distToAim, CONFIG.STEER_PROBE_DIST)
     local hit = workspace:Raycast(botPos + Vector3.new(0, 1, 0), dir * probeDist, RAY_PARAMS)
-    if not hit then return aimPos end
+    if not hit then
+        if steerState then steerState.active = false end
+        return aimPos
+    end
 
     local highRay = workspace:Raycast(botPos + Vector3.new(0, 5, 0), dir * probeDist, RAY_PARAMS)
-    if not highRay then return aimPos end
+    if not highRay then
+        if steerState then steerState.active = false end
+        return aimPos
+    end
 
     local n = hit.Normal * Vector3.new(1, 0, 1)
-    if n.Magnitude < 0.15 then return aimPos end
+    if n.Magnitude < 0.15 then
+        if steerState then steerState.active = false end
+        return aimPos
+    end
     n = n.Unit
 
     local tangent = dir - dir:Dot(n) * n
     if tangent.Magnitude < 0.15 then
         tangent = Vector3.new(-n.Z, 0, n.X)
+    else
+        tangent = tangent.Unit
     end
 
-    local steer = hit.Position + n * CONFIG.STEER_WALL_GAP + tangent.Unit * CONFIG.STEER_SLIDE_OFFSET
+    -- [[ HYSTERESIS ]] Once a slide side has been committed, keep using it
+    -- (still measured against the freshly-hit wall normal) until the commit
+    -- window expires or the natural tangent has clearly reversed. Without
+    -- this, small frame-to-frame changes in the aim direction flip which
+    -- side of the obstacle the detour offsets toward, which reads as
+    -- left-right shake while sliding along a wall.
+    local now = tick()
+    if steerState and steerState.active and steerState.tangent and now < steerState.untilT then
+        local agree = tangent:Dot(steerState.tangent)
+        if agree >= CONFIG.STEER_TANGENT_REVERSE_DOT then
+            tangent = (agree < 0) and -steerState.tangent or steerState.tangent
+        end
+    end
+
+    if steerState then
+        steerState.active = true
+        steerState.tangent = tangent
+        steerState.untilT = now + CONFIG.STEER_COMMIT_TIME
+    end
+
+    local steer = hit.Position + n * CONFIG.STEER_WALL_GAP + tangent * CONFIG.STEER_SLIDE_OFFSET
     return Vector3.new(steer.X, hit.Position.Y, steer.Z)
 end
 
@@ -1816,7 +1944,27 @@ task.spawn(function()
     local lastStuckPos = botRoot.Position
     local stuckCount = 0
     local turnBrakeCooldown = 0
-    
+
+    -- Flow-field local-target hysteresis (see fieldSteer) - shared by the
+    -- normal chase steering and the pocket-ambush steering since only one
+    -- of them ever drives movement at a time.
+    local fieldSteerState = { idx = nil, untilT = 0 }
+
+    -- Wall-slide detour hysteresis (see steerAroundObstacle)
+    local wallSteerState = { active = false, tangent = nil, untilT = 0 }
+
+    -- Smooth-facing state: current facing angle (radians, world Y-up yaw)
+    -- turned toward the target at a clamped rate instead of snapping.
+    local faceYaw = math.atan2(botRoot.CFrame.LookVector.X, botRoot.CFrame.LookVector.Z)
+
+    -- Previous-frame bot position, used to sweep the kill-volume check so a
+    -- fast-moving bot can't "step over" a player within a single Heartbeat.
+    local lastKillSweepPos = botRoot.Position
+
+    -- Guard-hold hysteresis: once parked on the landing zone, require a
+    -- bigger drift-out before resuming steering (stops edge-of-radius flicker)
+    local guardHoldActive = false
+
     local path = PathfindingService:CreatePath({
         AgentRadius = 2.0, 
         AgentHeight = 6.0, 
@@ -1978,15 +2126,18 @@ task.spawn(function()
         end
         
         -- ====================================================================
-        -- [[ KILL CHECK - FULL-BODY KILL VOLUME ]]
+        -- [[ KILL CHECK - FULL-BODY KILL VOLUME, SWEPT FOR RELIABILITY ]]
         -- Root-to-root under KILL_DIST, OR within the head's actual footprint:
         -- ~4.5 studs horizontally and anywhere from -6 to +10.5 vertically.
         -- Landing on the head, passing over it, or brushing it = contact = kill.
+        -- The check is swept across this frame's bot movement (previous root
+        -- position -> current root position) so a fast bot can't tunnel over
+        -- a player standing directly underneath without ever landing on an
+        -- exact instant that satisfies the test.
         -- ====================================================================
-        local headSpanKill = flatDistMag < CONFIG.KILL_FLAT_DIST
-            and yDiff > CONFIG.KILL_BELOW_SPAN
-            and yDiff < CONFIG.KILL_HEAD_SPAN
-        if dist < CONFIG.KILL_DIST or headSpanKill then
+        local killHit = sweepKillVolume(lastKillSweepPos, botRoot.Position, targetRoot.Position)
+        lastKillSweepPos = botRoot.Position
+        if killHit then
             local s = botRoot:FindFirstChild("Scream"); if s then s:Play() end
             triggerRagdoll(player.Character)
             targetHum.Health = 0
@@ -2127,14 +2278,19 @@ task.spawn(function()
             -- ================================================================
             if playerAirborne and AirState.active and AirState.tLand > 0.08 then
                 local toLanding = (AirState.landing - botRoot.Position) * Vector3.new(1, 0, 1)
-                if toLanding.Magnitude <= CONFIG.GUARD_HOLD_RADIUS then
+                local holdThreshold = guardHoldActive
+                    and (CONFIG.GUARD_HOLD_RADIUS + CONFIG.GUARD_HOLD_HYSTERESIS)
+                    or CONFIG.GUARD_HOLD_RADIUS
+                if toLanding.Magnitude <= holdThreshold then
+                    guardHoldActive = true
                     botHum:MoveTo(botRoot.Position)
                     faceTarget = targetRoot.Position -- eyes up, watching them fall
                     if statsLabel and statsLabel.TextColor3 ~= Color3.new(1, 0, 0) then
                         statsLabel.Text = "KILLS: " .. SCORE .. " [GUARD]"
                     end
                 else
-                    local movePos = steerAroundObstacle(botRoot.Position, aimPos, ignoreList)
+                    guardHoldActive = false
+                    local movePos = steerAroundObstacle(botRoot.Position, aimPos, ignoreList, wallSteerState)
                     botHum:MoveTo(movePos)
                     faceTarget = aimPos
                     if statsLabel and statsLabel.TextColor3 ~= Color3.new(1, 0, 0) then
@@ -2142,7 +2298,8 @@ task.spawn(function()
                     end
                 end
             else
-                local movePos = steerAroundObstacle(botRoot.Position, aimPos, ignoreList)
+                guardHoldActive = false
+                local movePos = steerAroundObstacle(botRoot.Position, aimPos, ignoreList, wallSteerState)
                 botHum:MoveTo(movePos)
                 faceTarget = aimPos
                 if statsLabel and statsLabel.TextColor3 ~= Color3.new(1, 0, 0) then
@@ -2155,7 +2312,7 @@ task.spawn(function()
             -- shadow is EXACTLY what made the bot slide under jumpers.
             waypoints = nil
             pathSource = nil
-            local movePos = steerAroundObstacle(botRoot.Position, targetRoot.Position, ignoreList)
+            local movePos = steerAroundObstacle(botRoot.Position, targetRoot.Position, ignoreList, wallSteerState)
             botHum:MoveTo(movePos)
             faceTarget = targetRoot.Position
             if statsLabel and statsLabel.TextColor3 ~= Color3.new(1, 0, 0) then
@@ -2247,7 +2404,7 @@ task.spawn(function()
                     if gridUsable then
                         local ok = ensureField(grid, botCx, botCz, ambush.target, ambush.target, forceRepath or grid.fieldDirty)
                         if ok then
-                            local steer = fieldSteer(botRoot, grid)
+                            local steer = fieldSteer(botRoot, grid, fieldSteerState)
                             if steer == "GOAL" then
                                 botHum:MoveTo(ambush.target)
                                 faceTarget = ambush.target
@@ -2276,7 +2433,7 @@ task.spawn(function()
                     local aimForField = aimPos or targetRoot.Position
                     fieldOK, fieldFresh = ensureField(grid, botCx, botCz, aimForField, targetRoot.Position, forceRepath or grid.fieldDirty)
                     if fieldOK then
-                        local steer, dir, wantJump, wantClimb = fieldSteer(botRoot, grid)
+                        local steer, dir, wantJump, wantClimb = fieldSteer(botRoot, grid, fieldSteerState)
                         if steer == "GOAL" then
                             waypoints = nil
                             pathSource = nil
@@ -2420,10 +2577,24 @@ task.spawn(function()
             end
         end
 
-        -- [[ SMOOTH FACING ]]
+        -- ====================================================================
+        -- [[ SMOOTH FACING - clamped turn-rate, no more snap/shake ]]
+        -- Previously this set botAlign.CFrame straight to a fresh lookAt
+        -- every Heartbeat: any small back-and-forth in faceTarget (steering
+        -- deciding between two close options) showed up as a visible
+        -- left-right head shake. Now the yaw is turned toward the target at
+        -- a clamped rate, so a flickering target just gets smoothly chased
+        -- instead of snapped to.
+        -- ====================================================================
         local faceFlat = (faceTarget - botRoot.Position) * Vector3.new(1, 0, 1)
-        if faceFlat.Magnitude > 0.5 then
-            botAlign.CFrame = CFrame.lookAt(botRoot.Position, Vector3.new(faceTarget.X, botRoot.Position.Y, faceTarget.Z))
+        if faceFlat.Magnitude > CONFIG.FACE_SNAP_DIST then
+            local desiredYaw = math.atan2(faceFlat.X, faceFlat.Z)
+            local diff = (desiredYaw - faceYaw + math.pi) % (2 * math.pi) - math.pi
+            local maxStep = math.rad(CONFIG.FACE_TURN_RATE_DEG) * dt
+            diff = math.clamp(diff, -maxStep, maxStep)
+            faceYaw = faceYaw + diff
+            local dir = Vector3.new(math.sin(faceYaw), 0, math.cos(faceYaw))
+            botAlign.CFrame = CFrame.lookAt(botRoot.Position, botRoot.Position + dir)
         end
     end)
 end)
