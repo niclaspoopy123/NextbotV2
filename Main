@@ -30,7 +30,7 @@ local CONFIG = {
     
     -- Mechanics
     KILL_DIST = 5, 
-    SPAWN_DIST = 45,
+    SPAWN_DIST = 5,
     CONSTANT_SPEED = 60, 
     JUMP_HEIGHT = 7.2, -- EXACTLY a default player's jump. No super jump. No boosts.
     
@@ -2214,7 +2214,11 @@ task.spawn(function()
     if not player.Character then player.CharacterAdded:Wait() end
     local targetRoot = player.Character:WaitForChild("HumanoidRootPart")
     
-    local startPos = targetRoot.Position + Vector3.new(CONFIG.SPAWN_DIST, 5, 0)
+    local rawStartPos = targetRoot.Position + Vector3.new(CONFIG.SPAWN_DIST, 0, 0)
+    local startPos = snapToGround(rawStartPos, {player.Character})
+    if startPos == rawStartPos then
+        startPos = targetRoot.Position + Vector3.new(CONFIG.SPAWN_DIST, 5, 0)
+    end
     local bot, botRoot, botHum, botAlign, botImg, botHead, clickDetector = createNextbot(startPos)
     print("GENIUS BOT V25.0 ONLINE - OVERHEAD KILL VOLUME + TRUE LANDING PREDICTION")
 
@@ -3051,7 +3055,17 @@ local function isFiniteVector3(v)
 end
 
 spawnRemote.OnServerEvent:Connect(function(player, spawnPosition)
-    if typeof(spawnPosition) ~= "Vector3" or not isFiniteVector3(spawnPosition) then
+    if not player then
+        return
+    end
+
+    local char = player.Character
+    local playerRoot = char and char:FindFirstChild("HumanoidRootPart")
+    if not playerRoot then
+        return
+    end
+
+    if spawnPosition ~= nil and (typeof(spawnPosition) ~= "Vector3" or not isFiniteVector3(spawnPosition)) then
         return
     end
 
@@ -3059,15 +3073,40 @@ spawnRemote.OnServerEvent:Connect(function(player, spawnPosition)
     if spawnToolLastUse[player] and now - spawnToolLastUse[player] < SPAWN_TOOL_COOLDOWN then
         return
     end
-    spawnToolLastUse[player] = now
 
     local botModel = workspace:FindFirstChild("Nextbot_V25_OverheadKill")
     local botRootPart = botModel and botModel:FindFirstChild("HumanoidRootPart")
-    if botRootPart then
-        botModel:PivotTo(CFrame.new(spawnPosition))
-        botRootPart.AssemblyLinearVelocity = Vector3.zero
-        print("[SpawnTool] " .. player.Name .. " spawned the nextbot at " .. tostring(spawnPosition))
+    if not botRootPart then
+        return
     end
+
+    local dir
+    if typeof(spawnPosition) == "Vector3" then
+        local flatDiff = Vector3.new(spawnPosition.X - playerRoot.Position.X, 0, spawnPosition.Z - playerRoot.Position.Z)
+        if flatDiff.Magnitude > 0.001 then
+            dir = flatDiff.Unit
+        end
+    end
+
+    if not dir then
+        local lookFlat = Vector3.new(playerRoot.CFrame.LookVector.X, 0, playerRoot.CFrame.LookVector.Z)
+        if lookFlat.Magnitude > 0.001 then
+            dir = lookFlat.Unit
+        else
+            dir = Vector3.new(1, 0, 0)
+        end
+    end
+
+    local rawPos = playerRoot.Position + dir * CONFIG.SPAWN_DIST
+    local finalPos = snapToGround(rawPos, {char, botModel})
+    if finalPos == rawPos then
+        finalPos = Vector3.new(rawPos.X, playerRoot.Position.Y, rawPos.Z)
+    end
+
+    spawnToolLastUse[player] = now
+    botModel:PivotTo(CFrame.new(finalPos))
+    botRootPart.AssemblyLinearVelocity = Vector3.zero
+    print("[SpawnTool] " .. player.Name .. " spawned the nextbot at " .. tostring(finalPos))
 end)
 
 Players.PlayerRemoving:Connect(function(player)
