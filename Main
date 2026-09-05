@@ -4,10 +4,23 @@ local RunService = game:GetService("RunService")
 local Debris = game:GetService("Debris")
 local Workspace = game:GetService("Workspace")
 local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 -- [[ GENIUS NEXTBOT V26.0 - IMPOSSIBLE-PATH NAV (GAP/LEDGE JUMP LINKS + LONG DROPS + JUMP-UPS) ]]
 -- [[   + ZERO-REACTION INPUT READ + LINK REINFORCEMENT LEARNING + FIXED/EXPANDED ML AIM MODEL      ]]
 -- [[   (NO TELEPORT / NO GLITCH / FAIR JUMP - every route uses the same 7.2 stud jump a player has) ]]
+
+-- [[ SPAWN TOOL CHANNEL ]]
+-- The spawn tool's client-side LocalScript fires this remote with the clicked
+-- world position; the server handler (at the bottom of this script) moves the
+-- nextbot there. The script still runs server-side first, so it always creates
+-- the remote; the client copy only ever finds it with WaitForChild.
+local spawnRemote = ReplicatedStorage:FindFirstChild("SpawnNextbotRemote")
+if not spawnRemote then
+    spawnRemote = Instance.new("RemoteEvent")
+    spawnRemote.Name = "SpawnNextbotRemote"
+    spawnRemote.Parent = ReplicatedStorage
+end
 
 local CONFIG = {
     -- Visuals
@@ -2980,4 +2993,83 @@ task.spawn(function()
             botAlign.CFrame = CFrame.lookAt(botRoot.Position, botRoot.Position + dir)
         end
     end)
+end)
+
+-- ========================================================================
+-- [[ 7. CLIENT-SIDE SPAWN TOOL ]]
+-- The server block below clones the "SpawnTool" LocalScript (a child of this
+-- script) into every player's PlayerScripts and hooks the server half of the
+-- spawn remote. The cloned LocalScript is the actual tool: it activates when
+-- the game starts, shows the "SPAWN TOOL ACTIVE" UI, drops a red neon marker
+-- where the player left-clicks, raycasts down to the ground, then asks the
+-- server (through spawnRemote) to spawn the nextbot there.
+--
+-- SETUP: game scripts cannot write Script.Source at runtime, so the client
+-- code ships as a real LocalScript instance named "SpawnTool" parented INSIDE
+-- this Main script. In Studio: right-click Main -> Insert Object ->
+-- LocalScript, name it "SpawnTool", and paste the contents of
+-- SpawnTool.client.lua (in this repository) into it.
+-- ========================================================================
+local spawnToolTemplate = script:FindFirstChild("SpawnTool")
+if not (spawnToolTemplate and spawnToolTemplate:IsA("LocalScript")) then
+    warn("[SpawnTool] Missing child LocalScript 'SpawnTool' inside the Main script - add it and paste SpawnTool.client.lua into it. Spawn tool disabled.")
+end
+
+local function seedSpawnTool(player)
+    if not spawnToolTemplate then
+        return
+    end
+    local ok, err = pcall(function()
+        local playerScripts = player:WaitForChild("PlayerScripts", 10)
+        if playerScripts and not playerScripts:FindFirstChild("SpawnTool") then
+            local toolScript = spawnToolTemplate:Clone()
+            toolScript.Parent = playerScripts
+        end
+    end)
+    if not ok then
+        warn("[SpawnTool] Failed to seed spawn tool for " .. player.Name .. ": " .. tostring(err))
+    end
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+    task.spawn(seedSpawnTool, p)
+end
+Players.PlayerAdded:Connect(function(p)
+    task.spawn(seedSpawnTool, p)
+end)
+
+-- Server half of the tool: the bot already exists by the time the player can
+-- see and click, so spawnRemote (created above) can simply move it. Every
+-- component must be finite (NaN/inf would corrupt the model's pivot) and each
+-- player is rate-limited so the remote can't be spammed every frame.
+local SPAWN_TOOL_COOLDOWN = 0.5
+local spawnToolLastUse = {}
+
+local function isFiniteVector3(v)
+    return v.X == v.X and v.Y == v.Y and v.Z == v.Z       -- not NaN
+        and math.abs(v.X) < math.huge and math.abs(v.Y) < math.huge and math.abs(v.Z) < math.huge
+end
+
+spawnRemote.OnServerEvent:Connect(function(player, spawnPosition)
+    if typeof(spawnPosition) ~= "Vector3" or not isFiniteVector3(spawnPosition) then
+        return
+    end
+
+    local now = tick()
+    if spawnToolLastUse[player] and now - spawnToolLastUse[player] < SPAWN_TOOL_COOLDOWN then
+        return
+    end
+    spawnToolLastUse[player] = now
+
+    local botModel = workspace:FindFirstChild("Nextbot_V25_OverheadKill")
+    local botRootPart = botModel and botModel:FindFirstChild("HumanoidRootPart")
+    if botRootPart then
+        botModel:PivotTo(CFrame.new(spawnPosition))
+        botRootPart.AssemblyLinearVelocity = Vector3.zero
+        print("[SpawnTool] " .. player.Name .. " spawned the nextbot at " .. tostring(spawnPosition))
+    end
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+    spawnToolLastUse[player] = nil
 end)
