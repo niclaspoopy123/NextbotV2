@@ -5,7 +5,9 @@ local Debris = game:GetService("Debris")
 local Workspace = game:GetService("Workspace")
 local CollectionService = game:GetService("CollectionService")
 
--- [[ GENIUS NEXTBOT V25.0 - OVERHEAD KILL VOLUME + TRUE LANDING PREDICTION (NO TELEPORT / NO GLITCH / FAIR JUMP) ]]
+-- [[ GENIUS NEXTBOT V26.0 - IMPOSSIBLE-PATH NAV (GAP/LEDGE JUMP LINKS + LONG DROPS + JUMP-UPS) ]]
+-- [[   + ZERO-REACTION INPUT READ + LINK REINFORCEMENT LEARNING + FIXED/EXPANDED ML AIM MODEL      ]]
+-- [[   (NO TELEPORT / NO GLITCH / FAIR JUMP - every route uses the same 7.2 stud jump a player has) ]]
 
 local CONFIG = {
     -- Visuals
@@ -82,9 +84,9 @@ local CONFIG = {
     TURN_BRAKE_STRENGTH = 0.25,
     TURN_BRAKE_COOLDOWN = 0.2,
     
-    -- Pathfinding (Roblox fallback)
-    PATH_REFRESH_CLOSE = 0.05,
-    PATH_REFRESH_FAR = 0.10,
+    -- Pathfinding (Roblox fallback) - ZERO-LATENCY: re-solve the instant the previous solve finishes
+    PATH_REFRESH_CLOSE = 0,
+    PATH_REFRESH_FAR = 0.03,
     AIM_DRIFT_REPATH = 4,
     WAYPOINT_SPACING = 1,
     PARTIAL_STUCK_RATIO = 0.45,
@@ -136,6 +138,22 @@ local CONFIG = {
     NAV_DROP_COST = 1.2,
     NAV_MIN_COST = 0.66,
 
+    -- [[ LONG DROPS ]] A nextbot takes no fall damage, so any ledge it can
+    -- reach the bottom of is a legal (if slower) route. Drops beyond
+    -- NAV_MAX_DROP are allowed up to NAV_LONG_DROP with a cost that grows
+    -- with the fall so short routes are still preferred.
+    NAV_LONG_DROP = 40,
+    NAV_DROP_COST_PER_STUD = 0.05,
+
+    -- [[ GAP / LEDGE JUMP LINKS ]] Ballistic links across voids and over
+    -- low walls - the "impossible" routes. A link is only recorded when the
+    -- landing sits under the real jump arc AND the arc itself is unobstructed.
+    NAV_GAP_JUMP_MAX_CELLS = 6,       -- furthest landing cell probed (6 * NAV_RES = 18 studs)
+    NAV_GAP_JUMP_COST = 1.35,         -- flow-field cost multiplier for a gap link (before learning)
+    NAV_GAP_JUMP_LEDGE_MARGIN = 0.75, -- landing must sit this far under the arc to count as clearable
+    NAV_GAP_EDGE_LOOKAHEAD_MIN = 2.5, -- take-off trigger: void detected this far ahead (studs)
+    NAV_GAP_EDGE_LOOKAHEAD_MAX = 5,
+
     -- [[ LADDER / TRUSS CLIMBING ]]
     -- Lets the nav grid treat TrussParts (Roblox's native climbable) and any
     -- part tagged/named "Ladder" as valid vertical links instead of walls.
@@ -144,9 +162,9 @@ local CONFIG = {
     LADDER_MIN_GAIN = 0,         -- extra safety margin added to STEP_UP_JUMP before a gap counts as "needs a ladder"
     
     -- [[ FLOW FIELD ENGINE ]]
-    NAV_FIELD_MIN_INTERVAL = 0.12,
-    NAV_FIELD_MAX_EXPANSIONS = 4500,
-    NAV_FIELD_AGE = 0.6,
+    NAV_FIELD_MIN_INTERVAL = 0,      -- ZERO-LATENCY: recompute as soon as the goal or bot cell changes
+    NAV_FIELD_MAX_EXPANSIONS = 9000, -- enough to flood the entire grid (still early-exits once the bot is settled)
+    NAV_FIELD_AGE = 0.4,
     
     -- [[ TEMPORAL HEAT MAP ]]
     NAV_HEAT_BUMP_STUCK = 1.2,
@@ -195,7 +213,26 @@ local CONFIG = {
     ML_LEARN_RATE = 0.05,   -- LMS step size - small so learning is stable, not twitchy
     ML_BLEND_MAX = 0.45,    -- hard cap on how much the learned model can steer the aim point
     ML_MIN_SPEED = 4,       -- don't bother training/predicting on near-stationary targets
-    ML_DEBUG = false        -- set true to print learned weights/confidence periodically
+    ML_DEBUG = false,       -- set true to print learned weights/confidence periodically
+
+    -- [[ ZERO-REACTION INTENT READ ]]
+    -- Humanoid.MoveDirection is the player's raw INPUT vector and replicates
+    -- to the server the same frame they press a key - before their velocity
+    -- has had time to change. Blending it into the predicted velocity lets
+    -- every layer (intercept, wall-cut, anti-juke, ML) react to the decision
+    -- itself instead of waiting for the physics to show it.
+    INTENT_BLEND = 0.65,        -- how far the predicted velocity leans toward the input direction
+    INTENT_JUKE_DOT = 0.35,     -- input direction swung past this (dot vs last input) = juke, instantly
+
+    -- [[ LINK REINFORCEMENT LEARNING ]]
+    -- Every gap/ledge jump the bot attempts is scored (landed / failed) and
+    -- the link's flow-field cost is updated multiplicatively (exponential
+    -- weights). Bad links get expensive and fall out of the route; links
+    -- that work get cheaper. Memory persists across grid rebuilds/respawns.
+    ML_LINK_LEARN_RATE = 0.25,
+    ML_LINK_MIN_MULT = 0.6,
+    ML_LINK_MAX_MULT = 6,
+    ML_LINK_TIMEOUT = 2.0,      -- seconds after take-off before an unfinished jump counts as failed
 }
 
 local RAY_PARAMS = RaycastParams.new()
@@ -212,6 +249,8 @@ local IS_SPECTATING = false
 
 local JukeState = {
     lastVel = Vector3.zero,
+    lastIntent = nil,       -- player's previous MoveDirection (flat unit) - zero-latency juke read
+    jukeEvent = false,      -- set the frame a juke is detected; consumed by the main loop to force an instant re-route
     reversalUntil = 0,
     jukeCount = 0,
     jukeDecayTimer = 0,
@@ -231,21 +270,38 @@ local function resetJukeMemory()
     JukeState.errEMA = 3
     JukeState.predLog = {}
     JukeState.lastVel = Vector3.zero
+    JukeState.lastIntent = nil
+    JukeState.jukeEvent = false
     AirState.active = false
     AirState.tLand = 0
 end
 
-local function updateJukeDetection(vel, now, dt)
+local function registerJuke(now)
+    JukeState.reversalUntil = now + CONFIG.JUKE_RECOVERY_TIME
+    JukeState.jukeCount = math.min(JukeState.jukeCount + 1, 8)
+    JukeState.jukeEvent = true
+end
+
+local function updateJukeDetection(vel, now, dt, intentU)
     local speed = vel.Magnitude
     local prev = JukeState.lastVel
+    -- Physics read: the velocity actually swung
     if speed > 6 and prev.Magnitude > 6 then
         local dot = vel.Unit:Dot(prev.Unit)
         if dot < CONFIG.JUKE_DETECT_DOT then
-            JukeState.reversalUntil = now + CONFIG.JUKE_RECOVERY_TIME
-            JukeState.jukeCount = math.min(JukeState.jukeCount + 1, 8)
+            registerJuke(now)
         end
     end
     JukeState.lastVel = vel
+
+    -- ZERO-LATENCY read: the INPUT swung. Fires the same frame the key is
+    -- pressed, before the velocity has moved at all.
+    if intentU and JukeState.lastIntent then
+        if intentU:Dot(JukeState.lastIntent) < CONFIG.INTENT_JUKE_DOT then
+            registerJuke(now)
+        end
+    end
+    JukeState.lastIntent = intentU
 
     JukeState.jukeDecayTimer += dt
     if JukeState.jukeDecayTimer >= 1 then
@@ -326,19 +382,27 @@ end
 
 local ML = {
     -- weights: [1]=bias [2]=turnRate [3]=wallAhead [4]=jukeCount [5]=speedNorm
-    wFwd = {1, 0, 0, 0, 0},
-    wLat = {0, 0, 0, 0, 0},
+    --          [6]=intentFwd [7]=intentLat [8]=botBearingLat [9]=botDistNorm
+    -- (6..9 are the zero-latency / situational features: what the player is
+    -- PRESSING right now and where the bot is relative to their heading)
+    wFwd = {1, 0, 0, 0, 0, 0, 0, 0, 0},
+    wLat = {0, 0, 0, 0, 0, 0, 0, 0, 0},
     pending = {},       -- predictions awaiting their ground-truth outcome
     confidence = 0,     -- 0..1, climbs as predictions keep proving accurate
     errEMA = 6,
     lastHeadingDir = nil,
     turnRateEMA = 0,
     debugTimer = 0,
+    emptyCtx = {},
 }
 
-local function mlFeatures(speed, jukeCount)
+local function mlFeatures(speed, jukeCount, ctx)
+    ctx = ctx or ML.emptyCtx
     local speedNorm = math.clamp(speed / 40, 0, 2)
-    return { 1, ML.turnRateEMA, 0, math.min(jukeCount, 6) / 6, speedNorm }
+    return {
+        1, ML.turnRateEMA, ctx.wallAhead or 0, math.min(jukeCount, 6) / 6, speedNorm,
+        ctx.intentFwd or 0, ctx.intentLat or 0, ctx.botLat or 0, ctx.botDist or 0,
+    }
 end
 
 local function mlDot(w, f)
@@ -362,9 +426,9 @@ end
 -- learned weights. Returns the predicted world position plus the raw
 -- forward/lateral offsets (in studs) so the caller can log them for later
 -- training against the real outcome.
-local function mlPredict(playerPos, velU, speed, jukeCount, leadT)
+local function mlPredict(playerPos, velU, speed, jukeCount, leadT, ctx)
     if not velU then return nil end
-    local f = mlFeatures(speed, jukeCount)
+    local f = mlFeatures(speed, jukeCount, ctx)
     local fwdOffset = mlDot(ML.wFwd, f) * speed * leadT
     local latOffset = mlDot(ML.wLat, f) * speed * leadT
     local right = Vector3.new(-velU.Z, 0, velU.X)
@@ -409,10 +473,13 @@ local function mlTrain(now, playerPos)
     if CONFIG.ML_DEBUG then
         ML.debugTimer += 1
         if ML.debugTimer % 120 == 0 then
-            print(string.format("[NextbotML] confidence=%.2f errEMA=%.2f wFwd={%.2f,%.2f,%.2f,%.2f,%.2f} wLat={%.2f,%.2f,%.2f,%.2f,%.2f}",
-                ML.confidence, ML.errEMA,
-                ML.wFwd[1], ML.wFwd[2], ML.wFwd[3], ML.wFwd[4], ML.wFwd[5],
-                ML.wLat[1], ML.wLat[2], ML.wLat[3], ML.wLat[4], ML.wLat[5]))
+            local function fmt(w)
+                local parts = {}
+                for i = 1, #w do parts[i] = string.format("%.2f", w[i]) end
+                return "{" .. table.concat(parts, ",") .. "}"
+            end
+            print(string.format("[NextbotML] confidence=%.2f errEMA=%.2f wFwd=%s wLat=%s",
+                ML.confidence, ML.errEMA, fmt(ML.wFwd), fmt(ML.wLat)))
         end
     end
 end
@@ -500,9 +567,24 @@ local function calculateUnjukeableMove(botRoot, playerRoot, botSpeed, ignoreList
 
     AirState.active = false
 
-    updateJukeDetection(vel, now, dt)
+    -- [[ ZERO-REACTION INTENT ]] read the input vector, not just the physics.
+    local playerHum = playerRoot.Parent and playerRoot.Parent:FindFirstChild("Humanoid")
+    local intent = playerHum and (playerHum.MoveDirection * Vector3.new(1, 0, 1)) or Vector3.zero
+    local intentU = (intent.Magnitude > 0.1) and intent.Unit or nil
+
+    updateJukeDetection(vel, now, dt, intentU)
     auditPredictions(now, playerPos)
     JukeState.avgSpeed = JukeState.avgSpeed * 0.95 + speed * 0.05
+
+    -- Predicted velocity: physics velocity leaned toward the input direction.
+    -- The moment they press a new key this already points the new way.
+    local predVel = vel
+    if intentU then
+        local intentSpeed = math.max(speed, ((playerHum and playerHum.WalkSpeed) or 16) * 0.85)
+        predVel = vel:Lerp(intentU * intentSpeed, CONFIG.INTENT_BLEND)
+    end
+    local predSpeed = predVel.Magnitude
+    local predU = (predSpeed > 0.5) and predVel.Unit or nil
 
     -- ML: keep the learned model training every frame regardless of which
     -- heuristic layer ends up choosing the aim point below.
@@ -525,7 +607,9 @@ local function calculateUnjukeableMove(botRoot, playerRoot, botSpeed, ignoreList
         return landing + flatU * guardLead, "AIR DROP"
     end
 
-    if speed < 4 then
+    -- Standing still AND not pressing anything = truly stationary. If they
+    -- are pressing a key we already know where they're about to go.
+    if (speed < 4 and not intentU) or not predU then
         return playerPos, "STATIONARY"
     end
 
@@ -539,23 +623,23 @@ local function calculateUnjukeableMove(botRoot, playerRoot, botSpeed, ignoreList
 
     local aimPos, tag = nil, "INTERCEPT"
 
-    -- LAYER 1: WALL CUT (+ double bounce)
+    -- LAYER 1: WALL CUT (+ double bounce) - read along the PREDICTED heading
     RAY_PARAMS.FilterDescendantsInstances = ignoreList
-    local wallReadDist = math.min(CONFIG.WALL_READ_DIST, speed * 0.9)
-    local forwardRay = workspace:Raycast(playerPos + Vector3.new(0, 1, 0), vel.Unit * wallReadDist, RAY_PARAMS)
+    local wallReadDist = math.min(CONFIG.WALL_READ_DIST, math.max(predSpeed, 8) * 0.9)
+    local forwardRay = workspace:Raycast(playerPos + Vector3.new(0, 1, 0), predU * wallReadDist, RAY_PARAMS)
 
     if forwardRay and forwardRay.Instance and dist < CONFIG.CORNER_TRAP_MAX_DIST then
         local flatNormal = forwardRay.Normal * Vector3.new(1, 0, 1)
         if flatNormal.Magnitude > 0.2 then
             flatNormal = flatNormal.Unit
-            local incoming = vel.Unit
+            local incoming = predU
             local reflection = incoming - (2 * incoming:Dot(flatNormal) * flatNormal)
-            aimPos = forwardRay.Position + reflection * (speed * 0.5)
+            aimPos = forwardRay.Position + reflection * (predSpeed * 0.5)
             tag = "WALL CUT"
 
             if CONFIG.CORNER_BOUNCE2_READ and reflection.Magnitude > 0.2 then
                 local reflUnit = reflection.Unit
-                local bounce2Len = speed * 0.5 + 4
+                local bounce2Len = predSpeed * 0.5 + 4
                 local bounce2Origin = forwardRay.Position + Vector3.new(0, 1, 0) + reflUnit * 0.5
                 local secondRay = workspace:Raycast(bounce2Origin, reflUnit * bounce2Len, RAY_PARAMS)
                 if secondRay and secondRay.Instance then
@@ -563,7 +647,7 @@ local function calculateUnjukeableMove(botRoot, playerRoot, botSpeed, ignoreList
                     if n2.Magnitude > 0.2 then
                         n2 = n2.Unit
                         local refl2 = reflUnit - (2 * reflUnit:Dot(n2) * n2)
-                        aimPos = secondRay.Position + refl2 * (speed * 0.4)
+                        aimPos = secondRay.Position + refl2 * (predSpeed * 0.4)
                         tag = "DOUBLE CUT"
                     end
                 end
@@ -571,21 +655,27 @@ local function calculateUnjukeableMove(botRoot, playerRoot, botSpeed, ignoreList
         end
     end
 
-    -- LAYER 2: PERFECT INTERCEPT
+    -- LAYER 2: PERFECT INTERCEPT (on the intent-blended velocity)
     if not aimPos then
         local jukePenalty = math.min(JukeState.jukeCount, 6) * 0.1
         local maxLead = math.clamp(CONFIG.MAX_LEAD_TIME * JukeState.leadScale * (1 - jukePenalty), 0.08, CONFIG.MAX_LEAD_TIME)
-        local t = solveInterceptTime(botFlat, playerFlat, vel, math.max(botSpeed, 5), maxLead)
-        aimPos = playerPos + vel * t
+        local t = solveInterceptTime(botFlat, playerFlat, predVel, math.max(botSpeed, 5), maxLead)
+        aimPos = playerPos + predVel * t
         tag = "INTERCEPT"
 
         table.insert(JukeState.predLog, { pos = aimPos, due = now + math.max(t, 0.15) })
         if #JukeState.predLog > 8 then table.remove(JukeState.predLog, 1) end
     end
 
-    -- LAYER 3: ANTI-JUKE
+    -- LAYER 3: ANTI-JUKE - we know their NEW input direction the frame they
+    -- press it, so instead of freezing on their body, lead a short step
+    -- along the new input.
     if now < JukeState.reversalUntil then
-        aimPos = playerPos
+        if intentU then
+            aimPos = playerPos + intentU * math.max(speed, 8) * 0.12
+        else
+            aimPos = playerPos
+        end
         tag = "ANTI-JUKE"
     end
 
@@ -604,14 +694,29 @@ local function calculateUnjukeableMove(botRoot, playerRoot, botSpeed, ignoreList
     -- accurately - at which point it's allowed to pull the aim point toward
     -- its own learned guess, capped at CONFIG.ML_BLEND_MAX so it can never
     -- fully override the hand-authored anti-juke/intercept logic.
-    if speed > CONFIG.ML_MIN_SPEED and ML.confidence > 0.05 then
+    -- BUGFIX (V26): the model used to log training samples ONLY once
+    -- confidence was already > 0.05 - and confidence starts at 0, so it
+    -- never trained a single step. Now it predicts + logs every frame; only
+    -- the aim BLEND is confidence-gated.
+    if speed > CONFIG.ML_MIN_SPEED then
         local leadT = math.clamp(CONFIG.MAX_LEAD_TIME * JukeState.leadScale, 0.08, CONFIG.MAX_LEAD_TIME)
         local velU = vel.Unit
-        local predicted, feat, fwdOffset, latOffset = mlPredict(playerPos, velU, speed, JukeState.jukeCount, leadT)
+        local right = Vector3.new(-velU.Z, 0, velU.X)
+        local toBot = botFlat - playerFlat
+        local ctx = {
+            wallAhead = forwardRay and 1 or 0,
+            intentFwd = intentU and intentU:Dot(velU) or 0,
+            intentLat = intentU and intentU:Dot(right) or 0,
+            botLat = (dist > 0.5) and toBot.Unit:Dot(right) or 0,
+            botDist = math.clamp(dist / 60, 0, 2),
+        }
+        local predicted, feat, fwdOffset, latOffset = mlPredict(playerPos, velU, speed, JukeState.jukeCount, leadT, ctx)
         if predicted then
-            local blend = math.clamp(ML.confidence * CONFIG.ML_BLEND_MAX, 0, CONFIG.ML_BLEND_MAX)
-            aimPos = aimPos:Lerp(predicted, blend)
-            if ML.confidence > 0.5 then tag = tag .. "+ML" end
+            if ML.confidence > 0.05 then
+                local blend = math.clamp(ML.confidence * CONFIG.ML_BLEND_MAX, 0, CONFIG.ML_BLEND_MAX)
+                aimPos = aimPos:Lerp(predicted, blend)
+                if ML.confidence > 0.5 then tag = tag .. "+ML" end
+            end
 
             table.insert(ML.pending, {
                 originPos = playerPos, velU = velU, speed = speed, leadT = leadT,
@@ -678,6 +783,18 @@ local function evaluateJump(botRoot, flatVel, ignoreList)
     return true, "CLEAR"
 end
 
+-- True when the floor disappears just ahead of the bot along `dir`: the
+-- exact frame to leave the ground for a gap link (max range, no early hop).
+local function gapEdgeAhead(botRoot, dir, ignoreList)
+    if not dir then return false end
+    RAY_PARAMS.FilterDescendantsInstances = ignoreList
+    local flatSpeed = (botRoot.AssemblyLinearVelocity * Vector3.new(1, 0, 1)).Magnitude
+    local lead = math.clamp(flatSpeed * 0.06, CONFIG.NAV_GAP_EDGE_LOOKAHEAD_MIN, CONFIG.NAV_GAP_EDGE_LOOKAHEAD_MAX)
+    local origin = botRoot.Position + dir * lead + Vector3.new(0, 0.5, 0)
+    local floor = workspace:Raycast(origin, Vector3.new(0, -(CONFIG.NAV_STEP_UP_WALK + 3.5), 0), RAY_PARAMS)
+    return floor == nil
+end
+
 local function jumpLinkStillClear(botRoot, jumpPoint, ignoreList)
     RAY_PARAMS.FilterDescendantsInstances = ignoreList
     local jumpDir = ((jumpPoint.Position - botRoot.Position) * Vector3.new(1, 0, 1))
@@ -701,6 +818,7 @@ local Nav = {
     STEP_UP_WALK = CONFIG.NAV_STEP_UP_WALK,
     STEP_UP_JUMP = CONFIG.NAV_STEP_UP_JUMP,
     MAX_DROP = CONFIG.NAV_MAX_DROP,
+    LONG_DROP = CONFIG.NAV_LONG_DROP,
     JUMP_COST = CONFIG.NAV_JUMP_COST,
     DROP_COST = CONFIG.NAV_DROP_COST,
     MIN_COST = CONFIG.NAV_MIN_COST,
@@ -843,6 +961,88 @@ local function navKillCell(grid, cx, cz, idx)
     end
 end
 
+-- ========================================================================
+-- [[ GAP / LEDGE JUMP LINKS + LINK REINFORCEMENT LEARNING ]]
+-- A link is a directed "jump from cell A, land on cell B" edge that the
+-- 8-neighbour grid cannot express: across a void, over a low wall, down
+-- onto a ledge. Links are discovered during grid expansion (see
+-- navProbeGapLink) and consumed by the flow field + fieldSteer.
+--
+-- Every link the bot actually attempts is scored by outcome and its cost
+-- is updated with a multiplicative (exponential-weights) rule. That memory
+-- is keyed by WORLD cell coordinates so it survives grid shifts, rebuilds
+-- and player respawns: the bot literally learns which jumps on this map
+-- work and which ones don't.
+-- ========================================================================
+
+local LinkMemory = { mult = {}, attempt = nil, successes = 0, failures = 0 }
+
+local function linkKey(cxA, czA, cxB, czB)
+    return cxA .. "," .. czA .. ">" .. cxB .. "," .. czB
+end
+
+local function linkLearnMult(key)
+    return LinkMemory.mult[key] or 1
+end
+
+local function linkLearnBegin(key, landing)
+    LinkMemory.attempt = { key = key, landing = landing, t0 = tick() }
+end
+
+local function linkLearnApply(key, success)
+    local m = LinkMemory.mult[key] or 1
+    local lr = CONFIG.ML_LINK_LEARN_RATE
+    if success then
+        m = m * (1 - lr)
+        LinkMemory.successes += 1
+    else
+        m = m * (1 + 2 * lr)
+        LinkMemory.failures += 1
+    end
+    LinkMemory.mult[key] = math.clamp(m, CONFIG.ML_LINK_MIN_MULT, CONFIG.ML_LINK_MAX_MULT)
+end
+
+-- Called every frame; resolves the in-flight jump attempt (if any) into a
+-- success/failure and updates the link's learned cost.
+local function linkLearnUpdate(botPos, grid, stuck)
+    local a = LinkMemory.attempt
+    if not a then return end
+    local flat = ((a.landing - botPos) * Vector3.new(1, 0, 1)).Magnitude
+    local dy = botPos.Y - a.landing.Y
+    local elapsed = tick() - a.t0
+    local outcome = nil
+    if flat < Nav.RES * 1.3 and math.abs(dy) < 4 then
+        outcome = true
+    elseif stuck or elapsed > CONFIG.ML_LINK_TIMEOUT or (elapsed > 0.5 and dy < -6) then
+        outcome = false
+    end
+    if outcome ~= nil then
+        linkLearnApply(a.key, outcome)
+        if grid then grid.fieldDirty = true end
+        LinkMemory.attempt = nil
+    end
+end
+
+local function navAddLink(g, idxA, idxB, cost, key)
+    g.links = g.links or {}
+    g.linkRev = g.linkRev or {}
+    local fwd = g.links[idxA]
+    if not fwd then fwd = {}; g.links[idxA] = fwd end
+    for _, L in ipairs(fwd) do if L.idx == idxB then return end end
+    fwd[#fwd + 1] = { idx = idxB, cost = cost, key = key }
+    local rev = g.linkRev[idxB]
+    if not rev then rev = {}; g.linkRev[idxB] = rev end
+    rev[#rev + 1] = { idx = idxA, cost = cost, key = key }
+end
+
+-- Maps an old-grid index onto the shifted grid (nil if it fell off the edge)
+local function navShiftedIdx(oi, W, dcx, dcz)
+    local ix = (oi - 1) % W + dcx
+    local iz = (oi - 1) // W + dcz
+    if ix < 0 or iz < 0 or ix >= W or iz >= W then return nil end
+    return iz * W + ix + 1
+end
+
 local function navShiftGrid(old, dcx, dcz, botPos, targetPos)
     local W = old.W
     local g = {
@@ -853,6 +1053,7 @@ local function navShiftGrid(old, dcx, dcz, botPos, targetPos)
         visited = table.create(W * W, false),
         heat = table.create(W * W, 0),
         climb = table.create(W * W, false),
+        links = {}, linkRev = {},
         queue = {}, head = 0,
         stamp = tick(),
         rp = old.rp,
@@ -861,6 +1062,7 @@ local function navShiftGrid(old, dcx, dcz, botPos, targetPos)
 
     local oldHeat = old.heat
     local oldClimb = old.climb
+    local oldLinks = old.links
     for iz = 0, W - 1 do
         local oiz = iz - dcz
         local validRow = oiz >= 0 and oiz < W
@@ -877,6 +1079,13 @@ local function navShiftGrid(old, dcx, dcz, botPos, targetPos)
                 g.visited[ni] = old.visited[oi]
                 if oldHeat then g.heat[ni] = oldHeat[oi] end
                 if oldClimb then g.climb[ni] = oldClimb[oi] end
+                local ol = oldLinks and oldLinks[oi]
+                if ol then
+                    for _, L in ipairs(ol) do
+                        local nt = navShiftedIdx(L.idx, W, dcx, dcz)
+                        if nt then navAddLink(g, ni, nt, L.cost, L.key) end
+                    end
+                end
             end
         end
     end
@@ -934,6 +1143,75 @@ local function navShiftGrid(old, dcx, dcz, botPos, targetPos)
     return g
 end
 
+-- [[ GAP / LEDGE PROBE ]] Called only for a neighbour that the ordinary
+-- step/drop/ladder logic rejected (void, wall, ceiling). Walks further out
+-- along the same direction looking for a landing the bot can reach with its
+-- normal, player-fair jump: the landing must lie under the ballistic arc at
+-- that range, the arc must be unobstructed, and the landing needs head room.
+-- The first valid landing wins (nearest is always cheapest and safest).
+local function navProbeGapLink(g, cx, cz, fromH, d)
+    local srcIdx = navIdx(g, cx, cz)
+    if not srcIdx then return 0 end
+    local dx, dz, dlen = NAV_DIRS[d][1], NAV_DIRS[d][2], NAV_DIRS[d][3]
+    local vy, airtime = jumpBallistics()
+    local gAcc = workspace.Gravity
+    local runSpeed = CONFIG.CONSTANT_SPEED * 0.9
+    local maxRange = runSpeed * airtime * CONFIG.JUMP_RANGE_FACTOR
+    local apex = CONFIG.JUMP_HEIGHT
+    local maxCells = math.floor(CONFIG.NAV_GAP_JUMP_MAX_CELLS / dlen)
+    local sx, sz = cx * Nav.RES, cz * Nav.RES
+    local rays = 0
+
+    for k = 2, maxCells do
+        local ncx, ncz = cx + dx * k, cz + dz * k
+        local nidx = navIdx(g, ncx, ncz)
+        if not nidx then break end
+        local flatDist = k * dlen * Nav.RES
+        if flatDist > maxRange then break end
+
+        -- height of the jump arc when it reaches this range
+        local tAt = flatDist / runSpeed
+        local arcY = vy * tAt - 0.5 * gAcc * tAt * tAt
+
+        local wx, wz = ncx * Nav.RES, ncz * Nav.RES
+        rays += 1
+        local ground = workspace:Raycast(
+            Vector3.new(wx, fromH + apex + 0.5, wz),
+            Vector3.new(0, -(apex + Nav.LONG_DROP + 1), 0), g.rp)
+        if ground then
+            local h = ground.Position.Y
+            local rise = h - fromH
+            if rise <= arcY - CONFIG.NAV_GAP_JUMP_LEDGE_MARGIN and rise <= apex - 1 and -rise <= Nav.LONG_DROP then
+                -- a cell already known at a very different height belongs to another layer: skip
+                if not g.visited[nidx] or not g.walk[nidx] or math.abs(g.height[nidx] - h) <= 3 then
+                    rays += 1
+                    local arcFrom = Vector3.new(sx, fromH + apex - 0.5, sz)
+                    local arcTo = Vector3.new(wx, (rise > 0) and (h + 4) or (fromH + apex - 0.5), wz)
+                    local arcRay = workspace:Raycast(arcFrom, arcTo - arcFrom, g.rp)
+                    if not arcRay then
+                        rays += 1
+                        local ceil = workspace:Raycast(Vector3.new(wx, h + 1.5, wz), Vector3.new(0, 5.5, 0), g.rp)
+                        if not ceil then
+                            if not g.walk[nidx] then
+                                g.visited[nidx] = true
+                                g.walk[nidx] = true
+                                g.height[nidx] = h
+                                g.cost[nidx] = navCostFromMaterial(ground.Material)
+                                table.insert(g.queue, {ncx, ncz, h})
+                            end
+                            local cost = flatDist * CONFIG.NAV_GAP_JUMP_COST
+                                * (1 + math.max(0, -rise) * CONFIG.NAV_DROP_COST_PER_STUD)
+                            navAddLink(g, srcIdx, nidx, cost, linkKey(cx, cz, ncx, ncz))
+                            return rays
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return rays
+end
+
 local function navExpandCell(g, cx, cz, fromH, rayBudget)
     local rays = 0
     for d = 1, 8 do
@@ -945,12 +1223,20 @@ local function navExpandCell(g, cx, cz, fromH, rayBudget)
             local wx, wz = ncx * Nav.RES, ncz * Nav.RES
             
             rays += 1
-            local ground = workspace:Raycast(Vector3.new(wx, fromH + 1.2, wz), Vector3.new(0, -(Nav.MAX_DROP + 2), 0), g.rp)
+            -- BUGFIX (V26): the old probe started at fromH + 1.2. Roblox
+            -- raycasts ignore any part the origin is INSIDE, so a 2..7 stud
+            -- ledge next door was invisible - the ray passed through it and
+            -- hit the floor underneath, so the bot never learned it could
+            -- jump up onto things. Start above the jump ceiling instead, and
+            -- look all the way down to LONG_DROP (no fall damage = a deep
+            -- ledge is a route, not a wall).
+            local probeTop = fromH + Nav.STEP_UP_JUMP + 0.5
+            local ground = workspace:Raycast(Vector3.new(wx, probeTop, wz), Vector3.new(0, -(Nav.STEP_UP_JUMP + 0.5 + Nav.LONG_DROP + 2), 0), g.rp)
             local placed = false
             if ground then
                 local h = ground.Position.Y
                 local dh = h - fromH
-                if dh <= Nav.STEP_UP_JUMP and -dh <= Nav.MAX_DROP then
+                if dh <= Nav.STEP_UP_JUMP and -dh <= Nav.LONG_DROP then
                     rays += 1
                     local ceil = workspace:Raycast(Vector3.new(wx, h + 1.5, wz), Vector3.new(0, 5.5, 0), g.rp)
                     if not ceil then
@@ -975,7 +1261,13 @@ local function navExpandCell(g, cx, cz, fromH, rayBudget)
                     g.cost[idx] = 1
                     g.climb[idx] = true
                     table.insert(g.queue, {ncx, ncz, topY})
+                    placed = true
                 end
+            end
+            -- [[ IMPOSSIBLE-PATH PROBE ]] nothing walkable or climbable next
+            -- door: look further out for a landing a real jump can reach.
+            if not placed then
+                rays += navProbeGapLink(g, cx, cz, fromH, d)
             end
         end
     end
@@ -1029,6 +1321,7 @@ local function navMaybeStartBuild(botPos, targetPos, ignoreList)
         visited = table.create(W * W, false),
         heat = table.create(W * W, 0),
         climb = table.create(W * W, false),
+        links = {}, linkRev = {},
         queue = {}, head = 0,
         stamp = tick(),
         rp = rp,
@@ -1106,7 +1399,14 @@ local function navNearestWalkable(grid, cx, cz, radius)
     return nil
 end
 
-local function navEdgeInfo(grid, cx, cz, d)
+-- Direction-aware edge test. `reverse` = the flow field is flooding from the
+-- goal outward (A is nearer the goal), so the bot would actually TRAVEL
+-- B -> A and the rise/drop limits must be applied in THAT direction.
+-- BUGFIX (V26): the old symmetric check let the field route the bot UP
+-- 10-stud walls it could never climb while forbidding perfectly legal
+-- 8-10 stud drops.
+-- Returns: ok, jumpE, dropE, idxB, climbE, dropStuds
+local function navEdgeInfo(grid, cx, cz, d, reverse)
     local idxA = navIdx(grid, cx, cz)
     if not idxA or not grid.walk[idxA] then return false end
     local dx = NAV_DIRS[d][1]
@@ -1115,19 +1415,23 @@ local function navEdgeInfo(grid, cx, cz, d)
     if not idxB or not grid.walk[idxB] then return false end
     -- A "climb" cell was only marked walkable because a ladder/truss bridges
     -- the gap, so its height difference doesn't need to (and generally
-    -- won't) respect the normal walk/jump step limits.
-    local climbE = grid.climb and grid.climb[idxB]
+    -- won't) respect the normal walk/jump step limits - in either direction
+    -- (you can climb down a ladder too).
+    local climbE = grid.climb and (grid.climb[idxB] or grid.climb[idxA])
     local dh = grid.height[idxB] - grid.height[idxA]
+    local rise = reverse and -dh or dh   -- height gained in the direction of travel
     if not climbE then
-        if dh > Nav.STEP_UP_JUMP then return false end
-        if -dh > Nav.MAX_DROP then return false end
+        if rise > Nav.STEP_UP_JUMP then return false end
+        if -rise > Nav.LONG_DROP then return false end
     end
     if d > 4 then
         local o1 = navIdx(grid, cx + dx, cz)
         local o2 = navIdx(grid, cx, cz + dz)
         if not (o1 and grid.walk[o1]) or not (o2 and grid.walk[o2]) then return false end
     end
-    return true, (not climbE) and (dh > Nav.STEP_UP_WALK), (not climbE) and (-dh > 4), idxB, climbE
+    local jumpE = (not climbE) and (rise > Nav.STEP_UP_WALK)
+    local dropE = (not climbE) and (-rise > 4)
+    return true, jumpE, dropE, idxB, climbE, math.max(0, -rise)
 end
 
 -- [[ FLOW FIELD: Dijkstra flood FROM THE GOALS outward ]]
@@ -1214,14 +1518,16 @@ local function navComputeField(grid, seedIdxList, botIdx)
             local cx = grid.cx0 + ix
             local cz = grid.cz0 + iz
             local gA = dist[idx]
+            -- reverse = true: idx is goal-side, the bot travels idxB -> idx
             for d = 1, 8 do
-                local ok, jumpE, dropE, idxB, climbE = navEdgeInfo(grid, cx, cz, d)
+                local ok, jumpE, dropE, idxB, climbE, dropStuds = navEdgeInfo(grid, cx, cz, d, true)
                 if ok then
                     local step = Nav.RES * NAV_DIRS[d][3] * cost[idxB] * (1 + heat[idxB])
                     if jumpE then
                         step *= Nav.JUMP_COST
                     elseif dropE then
-                        step *= Nav.DROP_COST
+                        -- deep drops stay legal but get progressively pricier
+                        step *= Nav.DROP_COST * (1 + math.max(0, dropStuds - Nav.MAX_DROP) * CONFIG.NAV_DROP_COST_PER_STUD)
                     elseif climbE then
                         step *= Nav.CLIMB_COST
                     end
@@ -1230,6 +1536,23 @@ local function navComputeField(grid, seedIdxList, botIdx)
                         dist[idxB] = t
                         distStamp[idxB] = computeNo
                         push(t, idxB)
+                    end
+                end
+            end
+            -- Gap/ledge jump links that LAND on this cell (bot jumps src -> idx),
+            -- priced with their learned multiplier so failed jumps fall out
+            -- of the route and proven ones get preferred.
+            local rl = grid.linkRev and grid.linkRev[idx]
+            if rl then
+                for _, L in ipairs(rl) do
+                    local src = L.idx
+                    if grid.walk[src] then
+                        local t = gA + L.cost * linkLearnMult(L.key) * (1 + heat[src])
+                        if distStamp[src] ~= computeNo or t < dist[src] then
+                            dist[src] = t
+                            distStamp[src] = computeNo
+                            push(t, src)
+                        end
                     end
                 end
             end
@@ -1294,6 +1617,39 @@ local function fieldSteer(botRoot, grid, steerState)
             end
         end
     end
+    -- [[ GAP / LEDGE LINKS ]] a ballistic link out of this cell competes
+    -- with the walkable neighbours on total remaining cost (field value at
+    -- the landing + the link's learned price). It only wins when it is on
+    -- the optimal descent, so it can't flicker against a neighbour.
+    local bestLink, bestLinkVal = nil, math.huge
+    local links = grid.links and grid.links[bIdx]
+    if links then
+        for _, L in ipairs(links) do
+            if grid.walk[L.idx] then
+                local v = dAt(L.idx)
+                if v < math.huge then
+                    local total = v + L.cost * linkLearnMult(L.key)
+                    if total < bestLinkVal then
+                        bestLinkVal = total
+                        bestLink = L
+                    end
+                end
+            end
+        end
+    end
+    if bestLink and (not bestIdx or bestLinkVal < bestVal + Nav.RES * 1.05) then
+        if steerState then
+            steerState.idx = bestLink.idx
+            steerState.untilT = tick() + CONFIG.FIELD_TARGET_COMMIT_TIME
+        end
+        local lcx = grid.cx0 + ((bestLink.idx - 1) % W)
+        local lcz = grid.cz0 + ((bestLink.idx - 1) // W)
+        local landing = Vector3.new(lcx * Nav.RES, grid.height[bestLink.idx] + 1.2, lcz * Nav.RES)
+        local toLand = (landing - botRoot.Position) * Vector3.new(1, 0, 1)
+        local ldir = (toLand.Magnitude > 0.1) and toLand.Unit or nil
+        return landing, ldir, false, false, { key = bestLink.key, landing = landing }
+    end
+
     if not bestIdx then
         if steerState then steerState.idx = nil end
         return nil
@@ -2246,6 +2602,19 @@ task.spawn(function()
         -- [[ UNJUKEABLE PREDICTION - every frame (LAYER 0 = true landing) ]]
         local aimPos, moveName = calculateUnjukeableMove(botRoot, targetRoot, botSpeed, ignoreList, dt)
 
+        -- [[ ZERO-REACTION RE-ROUTE ]] the frame a juke is read (from the
+        -- player's INPUT, not their velocity) the flow field and fallback
+        -- path are both invalidated, so the very next steering decision is
+        -- already built around the new heading.
+        if JukeState.jukeEvent then
+            JukeState.jukeEvent = false
+            forceRepath = true
+            if grid then grid.fieldDirty = true end
+        end
+
+        -- [[ LINK LEARNING ]] grade the jump we're currently in the middle of
+        linkLearnUpdate(botRoot.Position, grid, stuckCount > 0)
+
         -- [[ TURN ASSIST - skipped mid-air ]]
         local now = tick()
         local botFlatVel = botRoot.AssemblyLinearVelocity * Vector3.new(1, 0, 1)
@@ -2433,7 +2802,7 @@ task.spawn(function()
                     local aimForField = aimPos or targetRoot.Position
                     fieldOK, fieldFresh = ensureField(grid, botCx, botCz, aimForField, targetRoot.Position, forceRepath or grid.fieldDirty)
                     if fieldOK then
-                        local steer, dir, wantJump, wantClimb = fieldSteer(botRoot, grid, fieldSteerState)
+                        local steer, dir, wantJump, wantClimb, gapLink = fieldSteer(botRoot, grid, fieldSteerState)
                         if steer == "GOAL" then
                             waypoints = nil
                             pathSource = nil
@@ -2444,7 +2813,21 @@ task.spawn(function()
                             pathSource = nil
                             botHum:MoveTo(steer)
                             faceTarget = steer
-                            if wantJump and not wantClimb and tick() - JumpState.lastJump > CONFIG.JUMP_COOLDOWN then
+                            if gapLink then
+                                -- [[ GAP LINK ]] sprint straight at the landing and
+                                -- leave the ground the instant the floor ends. A
+                                -- normal jump, from the true edge = maximum range.
+                                if not botClimbing and LinkMemory.attempt == nil
+                                    and tick() - JumpState.lastJump > CONFIG.JUMP_COOLDOWN
+                                    and gapEdgeAhead(botRoot, dir, ignoreList) then
+                                    botHum.Jump = true
+                                    JumpState.lastJump = tick()
+                                    linkLearnBegin(gapLink.key, gapLink.landing)
+                                end
+                                if statsLabel and statsLabel.TextColor3 ~= Color3.new(1, 0, 0) then
+                                    statsLabel.Text = "KILLS: " .. SCORE .. " [LEAP]"
+                                end
+                            elseif wantJump and not wantClimb and tick() - JumpState.lastJump > CONFIG.JUMP_COOLDOWN then
                                 local synthVel = (dir or (steer - botRoot.Position) * Vector3.new(1, 0, 1).Unit)
                                     * math.max(flatVel.Magnitude, 14)
                                 local ok, why = evaluateJump(botRoot, synthVel, ignoreList)
@@ -2465,7 +2848,7 @@ task.spawn(function()
                             visualizeFieldDescent(botRoot, grid)
                         end
                         if statsLabel and statsLabel.TextColor3 ~= Color3.new(1, 0, 0) then
-                            statsLabel.Text = "KILLS: " .. SCORE .. " [FIELD]"
+                            statsLabel.Text = "KILLS: " .. SCORE .. (LinkMemory.attempt and " [LEAP]" or " [FIELD]")
                         end
                     end
                 end
