@@ -2320,6 +2320,8 @@ task.spawn(function()
     
     local startPos = chooseSpawnPosition(targetRoot.Position, player)
     local bot, botRoot, botHum, botAlign, botImg, botHead, clickDetector = createNextbot(startPos)
+    local pathRequestId = 0
+    local routeResetRequested = false
     print("GENIUS BOT V25.0 ONLINE - OVERHEAD KILL VOLUME + TRUE LANDING PREDICTION")
 
     local freezeBtn, spectateBtn = createControlGui(player)
@@ -2365,9 +2367,7 @@ task.spawn(function()
         if newRoot then
             targetRoot = newRoot
             pathRequestId += 1
-            waypoints = nil
-            pathSource = nil
-            forceRepath = true
+            routeResetRequested = true
             resetJukeMemory()
             mlResetEpisodeState()
             JumpState.lastJump = 0
@@ -2393,9 +2393,7 @@ task.spawn(function()
                     player = p
                     targetRoot = p.Character.HumanoidRootPart
                     pathRequestId += 1
-                    waypoints = nil
-                    pathSource = nil
-                    forceRepath = true
+                    routeResetRequested = true
                     createControlGui(player)
                     Nav.active = nil
                     Nav.pending = nil
@@ -2415,7 +2413,6 @@ task.spawn(function()
     local isComputing = false
     local forceRepath = false
     local pathSource = nil
-    local pathRequestId = 0
     
     -- Flow field state
     local fieldGoalKey, fieldBotKey = nil, nil
@@ -2568,6 +2565,13 @@ task.spawn(function()
         local targetHum = player.Character:FindFirstChild("Humanoid")
         if not targetHum or targetHum.Health <= 0 then return end
         if not botRoot or not botRoot.Parent then return end
+
+        if routeResetRequested then
+            waypoints = nil
+            pathSource = nil
+            forceRepath = true
+            routeResetRequested = false
+        end
         
         local ignoreList = {bot, player.Character}
         
