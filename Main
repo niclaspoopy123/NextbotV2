@@ -18,6 +18,7 @@ local CONFIG = {
     -- Mechanics
     KILL_DIST = 5, 
     SPAWN_DIST = 5,
+    SPAWN_TACTICAL_DIST = 35, -- preferred nearest-player distance when scoring SpawnLocations
     CONSTANT_SPEED = 60, 
     JUMP_HEIGHT = 7.2, -- EXACTLY a default player's jump. No super jump. No boosts.
     
@@ -85,11 +86,11 @@ local CONFIG = {
     TURN_BRAKE_COOLDOWN = 0.2,
     
     -- Pathfinding (Roblox fallback) - refresh often enough to track turns without thrashing
-    PATH_REFRESH_CLOSE = 0.12,
-    PATH_REFRESH_FAR = 0.2,
+    PATH_REFRESH_CLOSE = 0.10,
+    PATH_REFRESH_FAR = 0.16,
     AIM_DRIFT_REPATH = 4,
     WAYPOINT_SPACING = 2,
-    PARTIAL_STUCK_RATIO = 0.45,
+    PARTIAL_STUCK_RATIO = 0.38,
     
     -- Racing-Line (Roblox fallback paths only)
     STRING_PULL_BUDGET = 9,
@@ -106,7 +107,7 @@ local CONFIG = {
     STEER_MIN_AIM_DIST = 8,
     STEER_SLIDE_OFFSET = 8,
     STEER_WALL_GAP = 2.5,
-    STEER_COMMIT_TIME = 0.35,     -- min time to hold a wall-slide detour target before it's allowed to flip sides
+    STEER_COMMIT_TIME = 0.42,     -- min time to hold a wall-slide detour target before it's allowed to flip sides
     STEER_TANGENT_REVERSE_DOT = -0.3, -- committed slide side is kept unless the fresh tangent disagrees more than this (dot product); below it, trust the new reading instead of fighting a real direction reversal
 
     -- Smooth Facing (kills left-right head shake)
@@ -128,7 +129,7 @@ local CONFIG = {
     NAV_WARMUP_RAY_MULT = 2.5,
     NAV_SHIFT_AT = 3,
     NAV_FORCE_REBUILD_AGE = 12,
-    NAV_VERIFY_PER_FRAME = 18,
+    NAV_VERIFY_PER_FRAME = 26,
     NAV_ACTIVE_DRAIN_RAYS = 200,
     NAV_EDGE_MARGIN = 6,
     NAV_STEP_UP_WALK = 3,
@@ -149,7 +150,7 @@ local CONFIG = {
     -- low walls - the "impossible" routes. A link is only recorded when the
     -- landing sits under the real jump arc AND the arc itself is unobstructed.
     NAV_GAP_JUMP_MAX_CELLS = 6,       -- furthest landing cell probed (6 * NAV_RES = 18 studs)
-    NAV_GAP_JUMP_COST = 1.35,         -- flow-field cost multiplier for a gap link (before learning)
+    NAV_GAP_JUMP_COST = 1.5,          -- flow-field cost multiplier for a gap link (before learning)
     NAV_GAP_JUMP_LEDGE_MARGIN = 0.75, -- landing must sit this far under the arc to count as clearable
     NAV_GAP_EDGE_LOOKAHEAD_MIN = 2.5, -- take-off trigger: void detected this far ahead (studs)
     NAV_GAP_EDGE_LOOKAHEAD_MAX = 5,
@@ -162,8 +163,8 @@ local CONFIG = {
     LADDER_MIN_GAIN = 0,         -- extra safety margin added to STEP_UP_JUMP before a gap counts as "needs a ladder"
     
     -- [[ FLOW FIELD ENGINE ]]
-    NAV_FIELD_MIN_INTERVAL = 0.08,   -- keep route updates responsive without rebuilding the field every frame
-    NAV_FIELD_MAX_EXPANSIONS = 9000, -- enough to flood the entire grid (still early-exits once the bot is settled)
+    NAV_FIELD_MIN_INTERVAL = 0.06,   -- keep route updates responsive without rebuilding the field every frame
+    NAV_FIELD_MAX_EXPANSIONS = 12000, -- enough to flood the entire grid (still early-exits once the bot is settled)
     NAV_FIELD_AGE = 0.6,
     
     -- [[ TEMPORAL HEAT MAP ]]
@@ -190,6 +191,19 @@ local CONFIG = {
     UNSTUCK_HEAVY_FORWARD = 30,
     UNSTUCK_HEAVY_SIDE = 25,
     ESCAPE_SCAN_DIST = 12,
+
+    -- [[ PROGRESS-WINDOW STUCK ESCALATION ]] accumulated no-progress time
+    -- (seconds) at which each intervention tier kicks in, sampled on the
+    -- existing 0.2s stuck-monitor cadence.
+    STUCK_PROGRESS_SAMPLE = 0.2,       -- matches the stuck-monitor sample interval
+    STUCK_PROGRESS_MIN_EXPECTED = 3,   -- floor on expected per-sample progress (studs), so near-zero WalkSpeed can't disable the check
+    STUCK_PROGRESS_RATIO = 0.38,       -- separate from PARTIAL_STUCK_RATIO so tuning one doesn't silently retune the other
+    STUCK_PROGRESS_DECAY = 0.3,        -- per-sample decay while actually making progress
+    STUCK_PROGRESS_REPATH_AT = 0.8,    -- low tier: force a repath, no physics nudge
+    STUCK_PROGRESS_MEDIUM_AT = 1.6,    -- medium tier: moderate escape burst + repath
+    STUCK_PROGRESS_HARD_AT = 2.4,      -- hard tier: heavy escape burst + forced PF window
+    STUCK_PROGRESS_HARD_BACKOFF = 1.2, -- reset level after the hard tier fires (stops instant re-fire)
+    PF_FORCE_WINDOW = 1.5,             -- seconds the hard tier forces PathfindingService fallback
     
     -- World Analysis
     SPEED_BOOST_MATS = { [Enum.Material.Neon] = 1.5, [Enum.Material.Ice] = 1.3 },
@@ -229,9 +243,9 @@ local CONFIG = {
     -- the link's flow-field cost is updated multiplicatively (exponential
     -- weights). Bad links get expensive and fall out of the route; links
     -- that work get cheaper. Memory persists across grid rebuilds/respawns.
-    ML_LINK_LEARN_RATE = 0.25,
+    ML_LINK_LEARN_RATE = 0.30,
     ML_LINK_MIN_MULT = 0.6,
-    ML_LINK_MAX_MULT = 6,
+    ML_LINK_MAX_MULT = 8,
     ML_LINK_TIMEOUT = 2.0,      -- seconds after take-off before an unfinished jump counts as failed
 }
 
@@ -2193,6 +2207,89 @@ local function findEscapeDirection(botPos, toPlayerFlat, ignoreList)
     return bestDir
 end
 
+-- Shared "which way to bolt" helper for the unstuck bursts below: faces
+-- roughly toward the target (falling back to current heading when right on
+-- top of them), then hands off to findEscapeDirection to pick the clearest
+-- nearby direction.
+local function chaseEscapeDirection(botRoot, targetRoot, ignoreList)
+    local toPlayer = (targetRoot.Position - botRoot.Position) * Vector3.new(1, 0, 1)
+    if toPlayer.Magnitude > 1 then
+        toPlayer = toPlayer.Unit
+    else
+        toPlayer = botRoot.CFrame.LookVector * Vector3.new(1, 0, 1)
+    end
+    return findEscapeDirection(botRoot.Position, toPlayer, ignoreList)
+end
+
+-- [[ SPAWN LOCATION SELECTION ]] the bot now enters/re-enters the map at a
+-- real SpawnLocation - the same place a player would spawn - instead of an
+-- arbitrary offset from whoever it's chasing. Prefers a spawn near the
+-- active players (tactical distance band) but enforces a minimum safe gap
+-- so it never lands on top of someone. Falls back to a random spawn (or,
+-- failing that, the caller's offset position) when nothing better applies.
+local function getAllSpawnLocations()
+    local spawns = {}
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if inst:IsA("SpawnLocation") then
+            table.insert(spawns, inst)
+        end
+    end
+    return spawns
+end
+
+local function getAlivePlayerRoots()
+    local roots = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local char = plr.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if hum and hum.Health > 0 and root then
+            table.insert(roots, root)
+        end
+    end
+    return roots
+end
+
+local function chooseSpawnPosition(fallbackPos)
+    local minDist = math.max(CONFIG.SPAWN_DIST, 12)
+    local spawns = getAllSpawnLocations()
+    if #spawns == 0 then
+        return fallbackPos
+    end
+
+    local roots = getAlivePlayerRoots()
+    if #roots == 0 then
+        -- No alive players to reference - just pick a random spawn.
+        local pick = spawns[math.random(1, #spawns)]
+        return pick.Position + Vector3.new(0, 4, 0)
+    end
+
+    -- Score each spawn by its nearest-player distance: must clear the
+    -- minimum safe gap, then prefer a tactical distance band over the
+    -- absolute closest (spawning right next to someone isn't fair either).
+    local best, bestScore = nil, -math.huge
+    for _, s in ipairs(spawns) do
+        local nearest = math.huge
+        for _, r in ipairs(roots) do
+            local d = (s.Position - r.Position).Magnitude
+            if d < nearest then nearest = d end
+        end
+
+        if nearest >= minDist then
+            local score = -math.abs(nearest - CONFIG.SPAWN_TACTICAL_DIST)
+            if score > bestScore then
+                bestScore = score
+                best = s
+            end
+        end
+    end
+
+    if not best then
+        best = spawns[math.random(1, #spawns)]
+    end
+    return best.Position + Vector3.new(0, 4, 0)
+end
+
 -- 6. MAIN AI LOOP
 task.spawn(function()
     task.wait(1) 
@@ -2201,7 +2298,7 @@ task.spawn(function()
     if not player.Character then player.CharacterAdded:Wait() end
     local targetRoot = player.Character:WaitForChild("HumanoidRootPart")
     
-    local startPos = targetRoot.Position + Vector3.new(CONFIG.SPAWN_DIST, 0, 0)
+    local startPos = chooseSpawnPosition(targetRoot.Position + Vector3.new(CONFIG.SPAWN_DIST, 0, 0))
     local bot, botRoot, botHum, botAlign, botImg, botHead, clickDetector = createNextbot(startPos)
     print("GENIUS BOT V25.0 ONLINE - OVERHEAD KILL VOLUME + TRUE LANDING PREDICTION")
 
@@ -2254,6 +2351,13 @@ task.spawn(function()
             Nav.pending = nil
             Nav.firstBuildDone = false
             Nav.verifyCursor = 1
+
+            -- New round for this player: re-enter at a spawn point, same as
+            -- the initial spawn, instead of lingering wherever the last
+            -- chase ended.
+            local respawnPos = chooseSpawnPosition(newRoot.Position + Vector3.new(CONFIG.SPAWN_DIST, 0, 0))
+            botRoot.CFrame = CFrame.new(respawnPos)
+            botRoot.AssemblyLinearVelocity = Vector3.zero
         end
     end)
     
@@ -2300,6 +2404,22 @@ task.spawn(function()
     local lastStuckPos = botRoot.Position
     local stuckCount = 0
     local turnBrakeCooldown = 0
+
+    -- [[ PROGRESS-WINDOW STUCK DETECTION ]] the 0.2s snapshot above already
+    -- catches a single bad interval, but a bot that's merely crawling
+    -- forward (partial progress, never quite "stuck") can slip past it
+    -- forever. This accumulates no-progress time across samples and
+    -- escalates the response the longer it persists.
+    local noProgressTime = 0
+
+    -- [[ HYBRID PATHFINDING STATE ]] flow-field/nav-grid stays the primary
+    -- steering mode; PathfindingService is the fallback used both when the
+    -- field itself reports no usable route AND when progress-window stuck
+    -- detection (above) forces a short recovery window. forceUntil expiring
+    -- returns control to the flow field automatically. failCount is a
+    -- diagnostic rise/fall counter (rises on field failure, falls on field
+    -- success) kept for future tuning/telemetry - it doesn't gate behavior.
+    local PFState = { mode = "FIELD", failCount = 0, forceUntil = 0 }
 
     -- Flow-field local-target hysteresis (see fieldSteer) - shared by the
     -- normal chase steering and the pocket-ambush steering since only one
@@ -2568,10 +2688,7 @@ task.spawn(function()
                     botHum.Jump = true
                     if grid then bumpHeat(grid, botCx, botCz, CONFIG.NAV_HEAT_BUMP_STUCK) end
 
-                    local toPlayer = (targetRoot.Position - botRoot.Position) * Vector3.new(1, 0, 1)
-                    if toPlayer.Magnitude > 1 then toPlayer = toPlayer.Unit else toPlayer = botRoot.CFrame.LookVector * Vector3.new(1,0,1) end
-
-                    local escapeDir = findEscapeDirection(botRoot.Position, toPlayer, ignoreList)
+                    local escapeDir = chaseEscapeDirection(botRoot, targetRoot, ignoreList)
                     local perp = Vector3.new(-escapeDir.Z, 0, escapeDir.X)
 
                     if stuckCount <= CONFIG.UNSTUCK_BURST_THRESHOLD then
@@ -2595,6 +2712,42 @@ task.spawn(function()
                         end
                     end
                 end
+                -- [[ PROGRESS-WINDOW ESCALATION ]] on top of the immediate-
+                -- frame reactions above, accumulate how long meaningful
+                -- progress has stalled (decaying it back down whenever the
+                -- bot is actually covering ground) and escalate the response
+                -- the longer it persists instead of judging a single sample.
+                local expectedProgress = math.max(botHum.WalkSpeed * CONFIG.STUCK_PROGRESS_SAMPLE * CONFIG.STUCK_PROGRESS_RATIO, CONFIG.STUCK_PROGRESS_MIN_EXPECTED)
+                if moved < expectedProgress then
+                    noProgressTime += CONFIG.STUCK_PROGRESS_SAMPLE
+                else
+                    noProgressTime = math.max(0, noProgressTime - CONFIG.STUCK_PROGRESS_DECAY)
+                end
+
+                if noProgressTime > CONFIG.STUCK_PROGRESS_HARD_AT then
+                    -- Hard tier: one heavy unstuck burst plus a short forced
+                    -- PathfindingService recovery window (see hybrid
+                    -- pathfinding fallback in the chase loop below).
+                    local escapeDir2 = chaseEscapeDirection(botRoot, targetRoot, ignoreList)
+                    botRoot.AssemblyLinearVelocity = Vector3.zero
+                    botRoot.AssemblyLinearVelocity = (escapeDir2 * CONFIG.UNSTUCK_HEAVY_FORWARD)
+                        + Vector3.new(0, CONFIG.UNSTUCK_HEAVY_UP, 0)
+                    PFState.forceUntil = tick() + CONFIG.PF_FORCE_WINDOW
+                    PFState.failCount += 1
+                    forceRepath = true
+                    noProgressTime = CONFIG.STUCK_PROGRESS_HARD_BACKOFF -- stop this refiring every sample
+                elseif noProgressTime > CONFIG.STUCK_PROGRESS_MEDIUM_AT then
+                    -- Medium tier: a moderate escape burst, one notch under
+                    -- the full "heavy" response.
+                    local escapeDir2 = chaseEscapeDirection(botRoot, targetRoot, ignoreList)
+                    botRoot.AssemblyLinearVelocity = botRoot.AssemblyLinearVelocity
+                        + Vector3.new(0, CONFIG.UNSTUCK_VELOCITY_UP, 0)
+                        + escapeDir2 * CONFIG.UNSTUCK_VELOCITY_FORWARD
+                    forceRepath = true
+                elseif noProgressTime > CONFIG.STUCK_PROGRESS_REPATH_AT then
+                    forceRepath = true
+                end
+
                 lastStuckPos = botRoot.Position; lastStuckCheck = tick()
             end
         end
@@ -2795,10 +2948,14 @@ task.spawn(function()
                     statsLabel.Text = "KILLS: " .. SCORE .. " [AMBUSH]"
                 end
             else
-                -- [[ FLOW FIELD STEERING ]]
+                -- [[ FLOW FIELD STEERING ]] primary nav mode. When the hard
+                -- stuck tier above has forced a recovery window (PFState),
+                -- this is skipped so the PathfindingService fallback below
+                -- takes over until the window expires or a route resolves.
+                local pfForced = tick() < PFState.forceUntil
                 local fieldOK = false
                 local fieldFresh = false
-                if gridUsable then
+                if gridUsable and not pfForced then
                     local aimForField = aimPos or targetRoot.Position
                     fieldOK, fieldFresh = ensureField(grid, botCx, botCz, aimForField, targetRoot.Position, forceRepath or grid.fieldDirty)
                     if fieldOK then
@@ -2844,6 +3001,8 @@ task.spawn(function()
                     end
                     if fieldOK then
                         forceRepath = false
+                        PFState.mode = "FIELD"
+                        PFState.failCount = math.max(0, PFState.failCount - 1)
                         if fieldFresh and CONFIG.SHOW_WAYPOINTS then
                             visualizeFieldDescent(botRoot, grid)
                         end
@@ -2852,9 +3011,16 @@ task.spawn(function()
                         end
                     end
                 end
-                
-                -- [[ ROBLOX FALLBACK ]]
+
+                -- [[ ROBLOX FALLBACK ]] used whenever the flow field can't
+                -- steer this frame (no usable route) OR a stuck-recovery
+                -- window is forcing it, so route instability always has
+                -- somewhere to fall back to instead of stalling in place.
                 if not fieldOK then
+                    PFState.mode = "PF"
+                    if not pfForced then
+                        PFState.failCount += 1
+                    end
                     if (isComputing or Nav.pending) and aimPos then
                         botHum:MoveTo(aimPos)
                         faceTarget = aimPos
