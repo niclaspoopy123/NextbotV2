@@ -2193,6 +2193,75 @@ local function findEscapeDirection(botPos, toPlayerFlat, ignoreList)
     return bestDir
 end
 
+-- [[ SPAWN LOCATION SELECTION ]] the bot now enters/re-enters the map at a
+-- real SpawnLocation - the same place a player would spawn - instead of an
+-- arbitrary offset from whoever it's chasing. Prefers a spawn near the
+-- active players (tactical distance band) but enforces a minimum safe gap
+-- so it never lands on top of someone. Falls back to a random spawn (or,
+-- failing that, the caller's offset position) when nothing better applies.
+local function getAllSpawnLocations()
+    local spawns = {}
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if inst:IsA("SpawnLocation") then
+            table.insert(spawns, inst)
+        end
+    end
+    return spawns
+end
+
+local function getAlivePlayerRoots()
+    local roots = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local char = plr.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if hum and hum.Health > 0 and root then
+            table.insert(roots, root)
+        end
+    end
+    return roots
+end
+
+local function chooseSpawnPosition(fallbackPos)
+    local minDist = math.max(CONFIG.SPAWN_DIST, 12)
+    local spawns = getAllSpawnLocations()
+    if #spawns == 0 then
+        return fallbackPos
+    end
+
+    local roots = getAlivePlayerRoots()
+    if #roots == 0 then
+        -- No alive players to reference - just pick a random spawn.
+        local pick = spawns[math.random(1, #spawns)]
+        return pick.Position + Vector3.new(0, 4, 0)
+    end
+
+    -- Score each spawn by its nearest-player distance: must clear the
+    -- minimum safe gap, then prefer a tactical distance band over the
+    -- absolute closest (spawning right next to someone isn't fair either).
+    local best, bestScore = nil, -math.huge
+    for _, s in ipairs(spawns) do
+        local nearest = math.huge
+        for _, r in ipairs(roots) do
+            local d = (s.Position - r.Position).Magnitude
+            if d < nearest then nearest = d end
+        end
+
+        if nearest >= minDist then
+            local score = -math.abs(nearest - 35)
+            if score > bestScore then
+                bestScore = score
+                best = s
+            end
+        end
+    end
+
+    if not best then
+        best = spawns[math.random(1, #spawns)]
+    end
+    return best.Position + Vector3.new(0, 4, 0)
+end
+
 -- 6. MAIN AI LOOP
 task.spawn(function()
     task.wait(1) 
@@ -2201,7 +2270,7 @@ task.spawn(function()
     if not player.Character then player.CharacterAdded:Wait() end
     local targetRoot = player.Character:WaitForChild("HumanoidRootPart")
     
-    local startPos = targetRoot.Position + Vector3.new(CONFIG.SPAWN_DIST, 0, 0)
+    local startPos = chooseSpawnPosition(targetRoot.Position + Vector3.new(CONFIG.SPAWN_DIST, 0, 0))
     local bot, botRoot, botHum, botAlign, botImg, botHead, clickDetector = createNextbot(startPos)
     print("GENIUS BOT V25.0 ONLINE - OVERHEAD KILL VOLUME + TRUE LANDING PREDICTION")
 
@@ -2254,6 +2323,13 @@ task.spawn(function()
             Nav.pending = nil
             Nav.firstBuildDone = false
             Nav.verifyCursor = 1
+
+            -- New round for this player: re-enter at a spawn point, same as
+            -- the initial spawn, instead of lingering wherever the last
+            -- chase ended.
+            local respawnPos = chooseSpawnPosition(newRoot.Position + Vector3.new(CONFIG.SPAWN_DIST, 0, 0))
+            botRoot.CFrame = CFrame.new(respawnPos)
+            botRoot.AssemblyLinearVelocity = Vector3.zero
         end
     end)
     
@@ -2300,6 +2376,20 @@ task.spawn(function()
     local lastStuckPos = botRoot.Position
     local stuckCount = 0
     local turnBrakeCooldown = 0
+
+    -- [[ PROGRESS-WINDOW STUCK DETECTION ]] the 0.2s snapshot above already
+    -- catches a single bad interval, but a bot that's merely crawling
+    -- forward (partial progress, never quite "stuck") can slip past it
+    -- forever. This accumulates no-progress time across samples and
+    -- escalates the response the longer it persists.
+    local noProgressTime = 0
+
+    -- [[ HYBRID PATHFINDING STATE ]] flow-field/nav-grid stays the primary
+    -- steering mode; PathfindingService is the fallback used both when the
+    -- field itself reports no usable route AND when progress-window stuck
+    -- detection (above) forces a short recovery window. forceUntil expiring
+    -- returns control to the flow field automatically.
+    local PFState = { mode = "FIELD", failCount = 0, forceUntil = 0 }
 
     -- Flow-field local-target hysteresis (see fieldSteer) - shared by the
     -- normal chase steering and the pocket-ambush steering since only one
@@ -2595,6 +2685,46 @@ task.spawn(function()
                         end
                     end
                 end
+                -- [[ PROGRESS-WINDOW ESCALATION ]] on top of the immediate-
+                -- frame reactions above, accumulate how long meaningful
+                -- progress has stalled (decaying it back down whenever the
+                -- bot is actually covering ground) and escalate the response
+                -- the longer it persists instead of judging a single sample.
+                local expectedProgress = math.max(botHum.WalkSpeed * 0.2 * CONFIG.PARTIAL_STUCK_RATIO, 3)
+                if moved < expectedProgress then
+                    noProgressTime += 0.2
+                else
+                    noProgressTime = math.max(0, noProgressTime - 0.3)
+                end
+
+                if noProgressTime > 2.4 then
+                    -- Hard tier: one heavy unstuck burst plus a short forced
+                    -- PathfindingService recovery window (see hybrid
+                    -- pathfinding fallback in the chase loop below).
+                    local toPlayer2 = (targetRoot.Position - botRoot.Position) * Vector3.new(1, 0, 1)
+                    if toPlayer2.Magnitude > 1 then toPlayer2 = toPlayer2.Unit else toPlayer2 = botRoot.CFrame.LookVector * Vector3.new(1, 0, 1) end
+                    local escapeDir2 = findEscapeDirection(botRoot.Position, toPlayer2, ignoreList)
+                    botRoot.AssemblyLinearVelocity = Vector3.zero
+                    botRoot.AssemblyLinearVelocity = (escapeDir2 * CONFIG.UNSTUCK_HEAVY_FORWARD)
+                        + Vector3.new(0, CONFIG.UNSTUCK_HEAVY_UP, 0)
+                    PFState.forceUntil = tick() + 1.5
+                    PFState.failCount += 1
+                    forceRepath = true
+                    noProgressTime = 1.2 -- back off so this doesn't refire every sample
+                elseif noProgressTime > 1.6 then
+                    -- Medium tier: a moderate escape burst, one notch under
+                    -- the full "heavy" response.
+                    local toPlayer2 = (targetRoot.Position - botRoot.Position) * Vector3.new(1, 0, 1)
+                    if toPlayer2.Magnitude > 1 then toPlayer2 = toPlayer2.Unit else toPlayer2 = botRoot.CFrame.LookVector * Vector3.new(1, 0, 1) end
+                    local escapeDir2 = findEscapeDirection(botRoot.Position, toPlayer2, ignoreList)
+                    botRoot.AssemblyLinearVelocity = botRoot.AssemblyLinearVelocity
+                        + Vector3.new(0, CONFIG.UNSTUCK_VELOCITY_UP, 0)
+                        + escapeDir2 * CONFIG.UNSTUCK_VELOCITY_FORWARD
+                    forceRepath = true
+                elseif noProgressTime > 0.8 then
+                    forceRepath = true
+                end
+
                 lastStuckPos = botRoot.Position; lastStuckCheck = tick()
             end
         end
@@ -2795,10 +2925,14 @@ task.spawn(function()
                     statsLabel.Text = "KILLS: " .. SCORE .. " [AMBUSH]"
                 end
             else
-                -- [[ FLOW FIELD STEERING ]]
+                -- [[ FLOW FIELD STEERING ]] primary nav mode. When the hard
+                -- stuck tier above has forced a recovery window (PFState),
+                -- this is skipped so the PathfindingService fallback below
+                -- takes over until the window expires or a route resolves.
+                local pfForced = tick() < PFState.forceUntil
                 local fieldOK = false
                 local fieldFresh = false
-                if gridUsable then
+                if gridUsable and not pfForced then
                     local aimForField = aimPos or targetRoot.Position
                     fieldOK, fieldFresh = ensureField(grid, botCx, botCz, aimForField, targetRoot.Position, forceRepath or grid.fieldDirty)
                     if fieldOK then
@@ -2844,6 +2978,8 @@ task.spawn(function()
                     end
                     if fieldOK then
                         forceRepath = false
+                        PFState.mode = "FIELD"
+                        PFState.failCount = math.max(0, PFState.failCount - 1)
                         if fieldFresh and CONFIG.SHOW_WAYPOINTS then
                             visualizeFieldDescent(botRoot, grid)
                         end
@@ -2852,9 +2988,16 @@ task.spawn(function()
                         end
                     end
                 end
-                
-                -- [[ ROBLOX FALLBACK ]]
+
+                -- [[ ROBLOX FALLBACK ]] used whenever the flow field can't
+                -- steer this frame (no usable route) OR a stuck-recovery
+                -- window is forcing it, so route instability always has
+                -- somewhere to fall back to instead of stalling in place.
                 if not fieldOK then
+                    PFState.mode = "PF"
+                    if not pfForced then
+                        PFState.failCount += 1
+                    end
                     if (isComputing or Nav.pending) and aimPos then
                         botHum:MoveTo(aimPos)
                         faceTarget = aimPos
