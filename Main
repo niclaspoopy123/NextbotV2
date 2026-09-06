@@ -197,6 +197,7 @@ local CONFIG = {
     -- existing 0.2s stuck-monitor cadence.
     STUCK_PROGRESS_SAMPLE = 0.2,       -- matches the stuck-monitor sample interval
     STUCK_PROGRESS_MIN_EXPECTED = 3,   -- floor on expected per-sample progress (studs), so near-zero WalkSpeed can't disable the check
+    STUCK_PROGRESS_RATIO = 0.38,       -- separate from PARTIAL_STUCK_RATIO so tuning one doesn't silently retune the other
     STUCK_PROGRESS_DECAY = 0.3,        -- per-sample decay while actually making progress
     STUCK_PROGRESS_REPATH_AT = 0.8,    -- low tier: force a repath, no physics nudge
     STUCK_PROGRESS_MEDIUM_AT = 1.6,    -- medium tier: moderate escape burst + repath
@@ -2716,7 +2717,7 @@ task.spawn(function()
                 -- progress has stalled (decaying it back down whenever the
                 -- bot is actually covering ground) and escalate the response
                 -- the longer it persists instead of judging a single sample.
-                local expectedProgress = math.max(botHum.WalkSpeed * CONFIG.STUCK_PROGRESS_SAMPLE * CONFIG.PARTIAL_STUCK_RATIO, CONFIG.STUCK_PROGRESS_MIN_EXPECTED)
+                local expectedProgress = math.max(botHum.WalkSpeed * CONFIG.STUCK_PROGRESS_SAMPLE * CONFIG.STUCK_PROGRESS_RATIO, CONFIG.STUCK_PROGRESS_MIN_EXPECTED)
                 if moved < expectedProgress then
                     noProgressTime += CONFIG.STUCK_PROGRESS_SAMPLE
                 else
