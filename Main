@@ -2227,10 +2227,14 @@ end
 -- active players (tactical distance band) but enforces a minimum safe gap
 -- so it never lands on top of someone. Falls back to a random spawn (or,
 -- failing that, the caller's offset position) when nothing better applies.
-local function getAllSpawnLocations()
+local function getAllSpawnLocations(targetPlayer)
     local spawns = {}
     for _, inst in ipairs(Workspace:GetDescendants()) do
-        if inst:IsA("SpawnLocation") then
+        local teamMatches = not targetPlayer
+            or inst.Neutral
+            or not targetPlayer.Team
+            or inst.TeamColor == targetPlayer.TeamColor
+        if inst:IsA("SpawnLocation") and inst.Enabled and teamMatches then
             table.insert(spawns, inst)
         end
     end
@@ -2250,9 +2254,9 @@ local function getAlivePlayerRoots()
     return roots
 end
 
-local function chooseSpawnPosition(fallbackPos)
+local function chooseSpawnPosition(fallbackPos, targetPlayer)
     local minDist = math.max(CONFIG.SPAWN_DIST, 12)
-    local spawns = getAllSpawnLocations()
+    local spawns = getAllSpawnLocations(targetPlayer)
     if #spawns == 0 then
         return fallbackPos
     end
@@ -2298,8 +2302,10 @@ task.spawn(function()
     if not player.Character then player.CharacterAdded:Wait() end
     local targetRoot = player.Character:WaitForChild("HumanoidRootPart")
     
-    local startPos = chooseSpawnPosition(targetRoot.Position + Vector3.new(CONFIG.SPAWN_DIST, 0, 0))
+    local startPos = chooseSpawnPosition(targetRoot.Position, player)
     local bot, botRoot, botHum, botAlign, botImg, botHead, clickDetector = createNextbot(startPos)
+    local pathRequestId = 0
+    local routeResetRequested = false
     print("GENIUS BOT V25.0 ONLINE - OVERHEAD KILL VOLUME + TRUE LANDING PREDICTION")
 
     local freezeBtn, spectateBtn = createControlGui(player)
@@ -2344,6 +2350,8 @@ task.spawn(function()
         local newRoot = newChar:WaitForChild("HumanoidRootPart", 5)
         if newRoot then
             targetRoot = newRoot
+            pathRequestId += 1
+            routeResetRequested = true
             resetJukeMemory()
             mlResetEpisodeState()
             JumpState.lastJump = 0
@@ -2355,7 +2363,7 @@ task.spawn(function()
             -- New round for this player: re-enter at a spawn point, same as
             -- the initial spawn, instead of lingering wherever the last
             -- chase ended.
-            local respawnPos = chooseSpawnPosition(newRoot.Position + Vector3.new(CONFIG.SPAWN_DIST, 0, 0))
+            local respawnPos = chooseSpawnPosition(newRoot.Position, player)
             botRoot.CFrame = CFrame.new(respawnPos)
             botRoot.AssemblyLinearVelocity = Vector3.zero
         end
@@ -2368,6 +2376,8 @@ task.spawn(function()
                 if p ~= leavingPlayer and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
                     player = p
                     targetRoot = p.Character.HumanoidRootPart
+                    pathRequestId += 1
+                    routeResetRequested = true
                     createControlGui(player)
                     Nav.active = nil
                     Nav.pending = nil
@@ -2539,6 +2549,13 @@ task.spawn(function()
         local targetHum = player.Character:FindFirstChild("Humanoid")
         if not targetHum or targetHum.Health <= 0 then return end
         if not botRoot or not botRoot.Parent then return end
+
+        if routeResetRequested then
+            waypoints = nil
+            pathSource = nil
+            forceRepath = true
+            routeResetRequested = false
+        end
         
         local ignoreList = {bot, player.Character}
         
@@ -3038,6 +3055,10 @@ task.spawn(function()
 
                     if (targetMoved or aimMoved or pathExpired or forceRepath or waypoints == nil) and not isComputing then
                         isComputing = true; forceRepath = false
+                        waypoints = nil
+                        pathSource = nil
+                        pathRequestId += 1
+                        local requestId = pathRequestId
                         lastPathTime = tick(); lastTargetPos = targetRoot.Position
                         
                         local pathTarget = aimPos or targetRoot.Position
@@ -3052,6 +3073,10 @@ task.spawn(function()
                             local startGround = snapToGround(startBase, computeIgnore)
                             local targetGround = snapToGround(aimForPath, computeIgnore)
                             local success = pcall(function() path:ComputeAsync(startGround, targetGround) end)
+                            if requestId ~= pathRequestId then
+                                isComputing = false
+                                return
+                            end
                             if success and path.Status == Enum.PathStatus.Success then
                                 local newPoints = path:GetWaypoints()
                                 if #newPoints > 0 then
@@ -3062,6 +3087,10 @@ task.spawn(function()
                             elseif success then
                                 local retryGround = snapToGround(playerRootNow.Position, computeIgnore)
                                 local ok2 = pcall(function() path:ComputeAsync(startGround, retryGround) end)
+                                if requestId ~= pathRequestId then
+                                    isComputing = false
+                                    return
+                                end
                                 if ok2 and path.Status == Enum.PathStatus.Success then
                                     local newPoints = path:GetWaypoints()
                                     if #newPoints > 0 then
@@ -3070,10 +3099,10 @@ task.spawn(function()
                                         visualizeWaypoints(newPoints)
                                     end
                                 else
-                                    botHum:MoveTo(playerRootNow.Position)
+                                    botHum:MoveTo(aimForPath)
                                 end
                             else
-                                botHum:MoveTo(playerRootNow.Position)
+                                botHum:MoveTo(aimForPath)
                             end
                             isComputing = false
                         end)
