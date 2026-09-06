@@ -2230,11 +2230,15 @@ end
 local function getAllSpawnLocations(targetPlayer)
     local spawns = {}
     for _, inst in ipairs(Workspace:GetDescendants()) do
+        if not inst:IsA("SpawnLocation") then
+            continue
+        end
+
         local teamMatches = not targetPlayer
             or inst.Neutral
             or not targetPlayer.Team
             or inst.TeamColor == targetPlayer.TeamColor
-        if inst:IsA("SpawnLocation") and inst.Enabled and teamMatches then
+        if inst.Enabled and teamMatches then
             table.insert(spawns, inst)
         end
     end
