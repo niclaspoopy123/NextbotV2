@@ -17,7 +17,7 @@ local CONFIG = {
     
     -- Mechanics
     KILL_DIST = 5, 
-    SPAWN_DIST = 45,
+    SPAWN_DIST = 5,
     CONSTANT_SPEED = 60, 
     JUMP_HEIGHT = 7.2, -- EXACTLY a default player's jump. No super jump. No boosts.
     
@@ -84,11 +84,11 @@ local CONFIG = {
     TURN_BRAKE_STRENGTH = 0.25,
     TURN_BRAKE_COOLDOWN = 0.2,
     
-    -- Pathfinding (Roblox fallback) - ZERO-LATENCY: re-solve the instant the previous solve finishes
-    PATH_REFRESH_CLOSE = 0,
-    PATH_REFRESH_FAR = 0.03,
+    -- Pathfinding (Roblox fallback) - refresh often enough to track turns without thrashing
+    PATH_REFRESH_CLOSE = 0.12,
+    PATH_REFRESH_FAR = 0.2,
     AIM_DRIFT_REPATH = 4,
-    WAYPOINT_SPACING = 1,
+    WAYPOINT_SPACING = 2,
     PARTIAL_STUCK_RATIO = 0.45,
     
     -- Racing-Line (Roblox fallback paths only)
@@ -106,7 +106,7 @@ local CONFIG = {
     STEER_MIN_AIM_DIST = 8,
     STEER_SLIDE_OFFSET = 8,
     STEER_WALL_GAP = 2.5,
-    STEER_COMMIT_TIME = 0.2,     -- min time to hold a wall-slide detour target before it's allowed to flip sides
+    STEER_COMMIT_TIME = 0.35,     -- min time to hold a wall-slide detour target before it's allowed to flip sides
     STEER_TANGENT_REVERSE_DOT = -0.3, -- committed slide side is kept unless the fresh tangent disagrees more than this (dot product); below it, trust the new reading instead of fighting a real direction reversal
 
     -- Smooth Facing (kills left-right head shake)
@@ -114,8 +114,8 @@ local CONFIG = {
     FACE_SNAP_DIST = 0.5,        -- below this flat distance, stop turning entirely (avoids spin noise at point-blank)
 
     -- Flow-Field Local Target Stability
-    FIELD_TARGET_COMMIT_TIME = 0.18, -- min time to keep steering at the same neighbor cell
-    FIELD_TARGET_SWITCH_MARGIN = 0.35, -- a rival neighbor must beat the committed one by this much (studs of field cost) to steal the choice
+    FIELD_TARGET_COMMIT_TIME = 0.3, -- min time to keep steering at the same neighbor cell
+    FIELD_TARGET_SWITCH_MARGIN = 0.5, -- a rival neighbor must beat the committed one by this much (studs of field cost) to steal the choice
     
     -- Early Jump (Roblox fallback)
     EARLY_JUMP_LEAD = 0.10,
@@ -162,12 +162,12 @@ local CONFIG = {
     LADDER_MIN_GAIN = 0,         -- extra safety margin added to STEP_UP_JUMP before a gap counts as "needs a ladder"
     
     -- [[ FLOW FIELD ENGINE ]]
-    NAV_FIELD_MIN_INTERVAL = 0,      -- ZERO-LATENCY: recompute as soon as the goal or bot cell changes
+    NAV_FIELD_MIN_INTERVAL = 0.08,   -- keep route updates responsive without rebuilding the field every frame
     NAV_FIELD_MAX_EXPANSIONS = 9000, -- enough to flood the entire grid (still early-exits once the bot is settled)
-    NAV_FIELD_AGE = 0.4,
+    NAV_FIELD_AGE = 0.6,
     
     -- [[ TEMPORAL HEAT MAP ]]
-    NAV_HEAT_BUMP_STUCK = 1.2,
+    NAV_HEAT_BUMP_STUCK = 1.5,
     NAV_HEAT_BUMP_PARTIAL = 0.6,
     NAV_HEAT_BUMP_BLOCK = 0.8,
     NAV_HEAT_MAX = 4,
@@ -2201,7 +2201,7 @@ task.spawn(function()
     if not player.Character then player.CharacterAdded:Wait() end
     local targetRoot = player.Character:WaitForChild("HumanoidRootPart")
     
-    local startPos = targetRoot.Position + Vector3.new(CONFIG.SPAWN_DIST, 5, 0)
+    local startPos = targetRoot.Position + Vector3.new(CONFIG.SPAWN_DIST, 0, 0)
     local bot, botRoot, botHum, botAlign, botImg, botHead, clickDetector = createNextbot(startPos)
     print("GENIUS BOT V25.0 ONLINE - OVERHEAD KILL VOLUME + TRUE LANDING PREDICTION")
 
