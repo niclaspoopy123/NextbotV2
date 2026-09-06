@@ -2261,22 +2261,6 @@ local function chooseSpawnPosition(fallbackPos, targetPlayer)
         return fallbackPos
     end
 
-    -- If the target is standing on (or just above) a valid player spawn,
-    -- reuse that exact spawn. This keeps the bot in the same spawn system as
-    -- players instead of selecting a merely nearby platform.
-    if fallbackPos then
-        local nearestSpawn, nearestDist = nil, math.huge
-        for _, spawn in ipairs(spawns) do
-            local flatOffset = (spawn.Position - fallbackPos) * Vector3.new(1, 0, 1)
-            if flatOffset.Magnitude < nearestDist then
-                nearestSpawn, nearestDist = spawn, flatOffset.Magnitude
-            end
-        end
-        if nearestSpawn and nearestDist <= 10 then
-            return nearestSpawn.Position + Vector3.new(0, 4, 0)
-        end
-    end
-
     local roots = getAlivePlayerRoots()
     if #roots == 0 then
         -- No alive players to reference - just pick a random spawn.
